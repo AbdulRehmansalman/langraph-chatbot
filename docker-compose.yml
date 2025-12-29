@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  backend:
+    image: abdulrehman3433/ai-chatbot-be:latest
+    build:
+      context: ./ai-chatbot-be
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    container_name: ai-chatbot-be
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    image: abdulrehman3433/ai-chatbot-fe:latest
+    build:
+      context: ./ai-chatbot-fe
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://3.1.220.237:8000}
+    container_name: ai-chatbot-fe
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

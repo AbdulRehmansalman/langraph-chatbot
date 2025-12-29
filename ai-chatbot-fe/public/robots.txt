@@ -1,0 +1,19 @@
+User-agent: *
+Allow: /
+
+# Sitemap
+Sitemap: https://ai-chatbot.example.com/sitemap.xml
+
+# Disallow sensitive authentication pages from being crawled
+Disallow: /reset-password
+Disallow: /change-password
+
+# Allow important pages
+Allow: /
+Allow: /login
+Allow: /register
+Allow: /dashboard
+Allow: /forgot-password
+
+# Crawl-delay (optional, adjust based on server capacity)
+Crawl-delay: 1
