@@ -53,18 +53,29 @@ async def check_database() -> Dict[str, Any]:
 
 async def check_redis() -> Dict[str, Any]:
     """
-    Check Redis connectivity.
-    
+    Check Redis connectivity using the cache module.
+
     Returns:
         Dict with status and details
     """
     try:
-        # Note: Implement actual Redis check if Redis is critical
-        # For now, return healthy if Redis is optional
-        return {
-            "status": "healthy",
-            "message": "Redis check skipped (optional dependency)"
-        }
+        from app.rag.cache import get_cache_stats
+
+        stats = get_cache_stats()
+
+        if stats.get("redis_available"):
+            return {
+                "status": "healthy",
+                "cached_entries": stats.get("cached_entries", 0),
+                "hit_rate": f"{stats.get('hit_rate_percent', 0)}%",
+                "memory_mb": stats.get("redis_memory_mb", 0),
+                "message": "Redis connected and operational"
+            }
+        else:
+            return {
+                "status": "degraded",
+                "message": "Redis unavailable - caching disabled"
+            }
     except Exception as e:
         logger.error(f"Redis health check failed: {str(e)}")
         return {
@@ -253,6 +264,54 @@ async def startup_probe():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "checks": checks
             }
+        )
+
+
+@router.get("/health/cache", status_code=status.HTTP_200_OK)
+async def cache_stats():
+    """
+    Get detailed cache statistics.
+
+    Returns cache hit rate, entry count, and memory usage.
+    """
+    try:
+        from app.rag.cache import get_cache_stats
+
+        stats = get_cache_stats()
+        return {
+            "status": "ok",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cache": stats,
+        }
+    except Exception as e:
+        logger.error(f"Cache stats error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@router.delete("/health/cache", status_code=status.HTTP_200_OK)
+async def clear_cache():
+    """
+    Clear the response cache.
+
+    Use with caution in production.
+    """
+    try:
+        from app.rag.cache import invalidate_cache
+
+        deleted = await invalidate_cache()
+        return {
+            "status": "ok",
+            "deleted_entries": deleted,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Cache clear error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": str(e)}
         )
 
 

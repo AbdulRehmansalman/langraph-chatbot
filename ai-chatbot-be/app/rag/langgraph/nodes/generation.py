@@ -68,10 +68,22 @@ RESPONSE_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{question}"),
 ])
 
-FALLBACK_RESPONSE = (
-    "I apologize, but I couldn't find relevant information to answer your question. "
-    "Could you please rephrase or ask something else?"
-)
+FALLBACK_RESPONSES = {
+    "NO_DOCUMENTS": (
+        "I don't have any documents to search through yet. "
+        "Please upload some documents first, and then I'll be able to answer your questions."
+    ),
+    "NO_EMBEDDINGS": (
+        "Your documents are still being processed. "
+        "Please wait a moment and try again."
+    ),
+    "default": (
+        "I couldn't find relevant information in your documents to answer that question. "
+        "Try rephrasing your question or asking about different topics from your documents."
+    ),
+}
+
+FALLBACK_RESPONSE = FALLBACK_RESPONSES["default"]
 
 
 def _extract_citations(response: str, documents: list[dict]) -> list[dict]:
@@ -107,21 +119,50 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
         Updated state with generated response
     """
     start_time = time.time()
-    logger.info("Starting response generation")
 
     query = state.get("original_query", "")
     classification = state.get("query_classification", "general")
     context = get_response_context(state)
     documents = state.get("documents", [])
+    error_log = state.get("error_log", [])
+    user_id = state.get("user_id")
+
+    # DIAGNOSTIC LOGGING - trace what generation receives
+    logger.info("=" * 50)
+    logger.info("GENERATION NODE - STATE RECEIVED")
+    logger.info(f"  Query: {query[:80]}...")
+    logger.info(f"  Classification: {classification}")
+    logger.info(f"  User ID: {user_id}")
+    logger.info(f"  Documents received: {len(documents)}")
+    logger.info(f"  Context length: {len(context)} chars")
+    logger.info(f"  Error log entries: {len(error_log)}")
+    if error_log:
+        for err in error_log:
+            logger.info(f"    - {err.get('error_type')}: {err.get('message', '')[:50]}")
+    logger.info("=" * 50)
 
     updates = track_node(state, "generation")
 
     # Handle no context for document queries
     if classification == "document" and not documents:
-        logger.warning("No documents available for document query")
-        updates["response"] = FALLBACK_RESPONSE
+        logger.warning("=" * 50)
+        logger.warning("NO DOCUMENTS - RETURNING FALLBACK")
+        logger.warning(f"  Reason: classification={classification}, documents={len(documents)}")
+        logger.warning("=" * 50)
+
+        # Check error log for specific error types to provide better responses
+        fallback_response = FALLBACK_RESPONSE
+
+        for error in error_log:
+            error_type = error.get("error_type", "")
+            if error_type in FALLBACK_RESPONSES:
+                fallback_response = FALLBACK_RESPONSES[error_type]
+                logger.info(f"  Using specific fallback for: {error_type}")
+                break
+
+        updates["response"] = fallback_response
         updates["citations"] = []
-        updates["messages"] = [AIMessage(content=FALLBACK_RESPONSE)]
+        updates["messages"] = [AIMessage(content=fallback_response)]
         return updates
 
     try:

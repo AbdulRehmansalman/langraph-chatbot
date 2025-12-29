@@ -77,57 +77,49 @@ class RAGChainAdapter:
         """
         Stream response tokens.
 
+        NOTE: This method now uses the same retrieval path as invoke() to ensure
+        retrieval is ALWAYS executed. The sync wrapper runs the async agent.
+
         Args:
             query: User's query
 
         Yields:
             Response tokens
         """
-        # For sync streaming, use the LLM directly for simplicity
-        # Full agent streaming would require async context
+        import asyncio
+
+        logger.info(f"STREAM: Starting streaming for query: {query[:50]}...")
+
         try:
-            from app.services.document_processor import doc_processor
+            # Run the full agent to ensure retrieval executes
+            # This guarantees retrieval is not bypassed
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-            # Get relevant documents
-            documents = doc_processor.search_documents(
-                query=query,
-                user_id=self.user_id,
-                document_ids=self.document_ids,
-                top_k=5,
-            )
+            try:
+                agent = self._get_agent()
+                result = loop.run_until_complete(
+                    agent.invoke(
+                        query=query,
+                        user_id=self.user_id,
+                        document_ids=self.document_ids,
+                    )
+                )
 
-            # Build context
-            context = "\n\n".join([
-                f"[{i+1}] {doc['content']}"
-                for i, doc in enumerate(documents)
-            ])
+                # Get the full response from agent
+                response = result.get("response", "")
+                documents = result.get("documents", [])
 
-            # Create prompt
-            system_prompt = f"""You are a helpful assistant that answers questions based on the provided context.
+                logger.info(f"STREAM: Agent returned {len(documents)} documents")
 
-RULES:
-1. Use ONLY information from the provided context
-2. If the context doesn't contain the answer, say "I don't have enough information."
-3. Cite sources using [1], [2], etc. notation
-4. Be concise but thorough
+                # Yield response in chunks to simulate streaming
+                # This maintains streaming UX while ensuring retrieval runs
+                chunk_size = 20
+                for i in range(0, len(response), chunk_size):
+                    yield response[i:i + chunk_size]
 
-Context:
-{context}"""
-
-            # Get LLM and stream
-            llm = llm_factory.create_llm(streaming=True)
-
-            from langchain_core.prompts import ChatPromptTemplate
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", system_prompt),
-                ("human", "{question}"),
-            ])
-
-            chain = prompt | llm
-
-            for chunk in chain.stream({"question": query}):
-                if hasattr(chunk, "content") and chunk.content:
-                    yield chunk.content
+            finally:
+                loop.close()
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
