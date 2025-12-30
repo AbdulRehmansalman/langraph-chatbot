@@ -46,6 +46,7 @@ spacy>=3.7.0
 
 # Date/Time Parsing
 python-dateutil>=2.8.0
+dateparser>=1.2.0
 
 # Pydantic & Validation
 pydantic==2.10.3

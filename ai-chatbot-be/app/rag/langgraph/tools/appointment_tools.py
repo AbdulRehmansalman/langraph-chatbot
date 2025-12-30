@@ -19,7 +19,149 @@ import re
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+try:
+    import dateparser
+    DATEPARSER_AVAILABLE = True
+except ImportError:
+    DATEPARSER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# NLP HELPER FUNCTIONS
+# =============================================================================
+
+def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
+    """
+    Enhanced NLP date parsing using dateparser library.
+
+    Supports formats like:
+    - "tomorrow at 2pm"
+    - "next Monday 10:30am"
+    - "in 2 hours"
+    - "Friday afternoon"
+    - "December 31st at 5pm"
+
+    Returns:
+        dict with keys: datetime, confidence, ambiguous
+    """
+    if DATEPARSER_AVAILABLE:
+        settings = {
+            'TIMEZONE': timezone,
+            'RETURN_AS_TIMEZONE_AWARE': True,
+            'PREFER_DATES_FROM': 'future',
+        }
+        parsed = dateparser.parse(text, settings=settings)
+
+        if parsed:
+            # Handle ambiguous time-of-day keywords
+            text_lower = text.lower()
+            if 'afternoon' in text_lower and parsed.hour < 12:
+                parsed = parsed.replace(hour=14)
+            elif 'morning' in text_lower and parsed.hour > 12:
+                parsed = parsed.replace(hour=10)
+            elif 'evening' in text_lower and parsed.hour < 17:
+                parsed = parsed.replace(hour=18)
+
+            ambiguous = any(w in text_lower for w in ['afternoon', 'morning', 'evening'])
+            return {"datetime": parsed, "confidence": 0.9 if not ambiguous else 0.7, "ambiguous": ambiguous}
+
+        return {"datetime": None, "confidence": 0, "ambiguous": True}
+    else:
+        # Fallback to original parser
+        try:
+            parsed = parse_natural_datetime(text)
+            return {"datetime": parsed, "confidence": 0.8, "ambiguous": False}
+        except Exception:
+            return {"datetime": None, "confidence": 0, "ambiguous": True}
+
+
+def extract_duration(text: str) -> int:
+    """
+    Extract meeting duration from natural language. Default: 30 minutes.
+
+    Examples:
+    - "30 minute meeting" → 30
+    - "2 hour workshop" → 120
+    - "quick sync" → 30
+    """
+    text_lower = text.lower()
+
+    # Explicit hour duration
+    hour_match = re.search(r'(\d+)\s*(?:hour|hr)s?', text_lower)
+    if hour_match:
+        return int(hour_match.group(1)) * 60
+
+    # Explicit minute duration
+    min_match = re.search(r'(\d+)\s*(?:minute|min)s?', text_lower)
+    if min_match:
+        return int(min_match.group(1))
+
+    # Keyword-based duration inference
+    if any(w in text_lower for w in ['quick', 'brief', 'sync', 'standup', 'check-in']):
+        return 30
+    if any(w in text_lower for w in ['workshop', 'training', 'presentation', 'demo']):
+        return 120
+    if 'all-day' in text_lower or 'all day' in text_lower:
+        return 480
+
+    return 30  # Default duration
+
+
+def extract_attendees(text: str) -> list[str]:
+    """Extract email addresses from text."""
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    return re.findall(email_pattern, text)
+
+
+def extract_meeting_title(text: str) -> str:
+    """Extract or generate a meeting title from the query."""
+    text_lower = text.lower()
+
+    # Look for explicit title patterns
+    title_match = re.search(r'(?:titled?|called?|named?)\s+["\']?([^"\']+)["\']?', text_lower)
+    if title_match:
+        return title_match.group(1).strip().title()
+
+    # Infer from meeting type keywords
+    if 'sync' in text_lower:
+        return 'Sync Meeting'
+    if 'standup' in text_lower or 'stand-up' in text_lower:
+        return 'Standup'
+    if '1:1' in text_lower or 'one on one' in text_lower or '1-on-1' in text_lower:
+        return '1:1 Meeting'
+    if 'interview' in text_lower:
+        return 'Interview'
+    if 'demo' in text_lower:
+        return 'Demo'
+    if 'review' in text_lower:
+        return 'Review Meeting'
+    if 'planning' in text_lower:
+        return 'Planning Session'
+
+    return 'Meeting'
+
+
+def format_confirmation_request(dt: datetime, duration: int, title: str, attendees: list) -> str:
+    """Format a meeting confirmation request for user approval."""
+    msg = f"I'll schedule **{title}** for:\n\n"
+    msg += f"- **Date:** {dt.strftime('%A, %B %d, %Y')}\n"
+    msg += f"- **Time:** {dt.strftime('%I:%M %p')}\n"
+    msg += f"- **Duration:** {duration} minutes\n"
+    if attendees:
+        msg += f"- **Attendees:** {', '.join(attendees)}\n"
+    msg += "\nReply **yes** to confirm or provide a different time."
+    return msg
+
+
+def format_meeting_success(result: dict) -> str:
+    """Format a successful meeting confirmation message."""
+    return (
+        f"**Meeting scheduled!**\n\n"
+        f"- **{result.get('title', 'Meeting')}**\n"
+        f"- {result.get('message', '')}\n"
+    )
 
 
 class CalendarCheckInput(BaseModel):

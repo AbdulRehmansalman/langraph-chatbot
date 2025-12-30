@@ -449,31 +449,57 @@ async def direct_node(state: AgentState) -> dict:
 
 async def scheduling_flow_node(state: AgentState) -> dict:
     """
-    Handle scheduling conversation when user confirms they want to book.
+    Complete booking when user confirms with 'yes'.
 
-    This node asks for appointment details (date, time, location).
+    This node reads the pending_schedule from state and actually creates the meeting.
     """
-    user_name = state.get("user_name", "there")
-    scheduling_context = state.get("scheduling_context", "your appointment")
-
-    updates = track_node(state, "scheduling_flow")
-
-    # Ask for scheduling details
-    response = (
-        f"Great, {user_name}! I'd be happy to help you schedule an appointment.\n\n"
-        "📋 **Please provide the following details:**\n"
-        "- **Preferred date** (e.g., tomorrow, next Monday, January 15th)\n"
-        "- **Preferred time** (e.g., 10:00 AM, afternoon, 3pm)\n"
-        "- **Location preference** (if applicable)\n\n"
-        "For example: *'Tomorrow at 2pm at the main office'*"
+    from app.rag.langgraph.tools.appointment_tools import (
+        schedule_meeting,
+        format_meeting_success,
     )
 
-    updates["response"] = response
-    updates["should_end"] = False
-    updates["awaiting_scheduling_confirmation"] = False  # Reset - now awaiting details
-    updates["messages"] = [AIMessage(content=response)]
+    updates = track_node(state, "scheduling_flow")
+    pending = state.get("pending_schedule")
 
-    logger.info("Scheduling flow: Asked user for appointment details")
+    if not pending:
+        # No pending meeting - ask what they want to book
+        updates["response"] = "No pending meeting to schedule. What would you like to book?"
+        updates["should_end"] = False
+        updates["messages"] = [AIMessage(content=updates["response"])]
+        return updates
+
+    # Actually create the meeting
+    try:
+        result = await schedule_meeting.ainvoke({
+            "title": pending["title"],
+            "datetime_str": pending["datetime"],
+            "duration_minutes": pending["duration"],
+            "participants": pending.get("attendees"),
+            "user_id": pending.get("user_id"),
+        })
+
+        if result.get("success"):
+            updates["scheduled_meeting"] = result
+            updates["response"] = format_meeting_success(result)
+            logger.info(f"Meeting scheduled successfully: {result.get('meeting_id')}")
+        else:
+            updates["response"] = f"Could not schedule: {result.get('message', 'Unknown error')}"
+            if result.get("alternative_slots"):
+                updates["response"] += "\n\n**Alternative times:**\n"
+                for slot in result["alternative_slots"][:3]:
+                    updates["response"] += f"- {slot['start']}\n"
+
+    except Exception as e:
+        logger.error(f"Scheduling error: {e}")
+        updates["response"] = f"Error scheduling meeting: {str(e)}"
+
+    # Clear pending state
+    updates["pending_schedule"] = None
+    updates["awaiting_scheduling_confirmation"] = False
+    updates["should_end"] = True
+    updates["messages"] = [AIMessage(content=updates["response"])]
+
+    logger.info("Scheduling flow: Completed booking")
 
     return updates
 
@@ -511,43 +537,88 @@ async def document_node(state: AgentState) -> dict:
 
 
 async def calendar_node(state: AgentState) -> dict:
-    """Handle calendar/appointment queries."""
+    """Handle calendar/appointment queries with NLP parsing."""
     from app.rag.langgraph.tools.appointment_tools import (
+        parse_natural_datetime_enhanced,
+        extract_duration,
+        extract_attendees,
+        extract_meeting_title,
+        format_confirmation_request,
         check_calendar,
         schedule_meeting,
         find_available_slots,
     )
 
-    query = state.get("original_query", "").lower()
+    query = state.get("original_query", "")
     user_id = state.get("user_id")
+    timezone = state.get("timezone", "UTC")
 
     updates = track_node(state, "calendar")
 
     try:
-        if any(word in query for word in ["schedule", "book", "create", "set up"]):
-            result = await schedule_meeting.ainvoke({
-                "title": "Meeting",
-                "datetime_str": "tomorrow at 10am",
-                "user_id": user_id,
-            })
-            updates["calendar_action"] = "schedule"
-            updates["scheduled_meeting"] = result
+        query_lower = query.lower()
 
-        elif any(word in query for word in ["available", "free", "slot"]):
+        if any(word in query_lower for word in ["schedule", "book", "create", "set up"]):
+            # Parse datetime from ACTUAL user query (not hardcoded!)
+            parsed = parse_natural_datetime_enhanced(query, timezone)
+
+            if not parsed["datetime"]:
+                updates["response"] = (
+                    "I couldn't understand the date/time. Please specify like:\n"
+                    "- 'tomorrow at 2pm'\n"
+                    "- 'next Monday at 10:30am'\n"
+                    "- 'in 2 hours'"
+                )
+                updates["should_end"] = True
+                return updates
+
+            duration = extract_duration(query)
+            attendees = extract_attendees(query)
+            title = extract_meeting_title(query)
+
+            # Store pending schedule for confirmation
+            updates["pending_schedule"] = {
+                "datetime": parsed["datetime"].isoformat(),
+                "duration": duration,
+                "attendees": attendees,
+                "title": title,
+                "user_id": user_id,
+            }
+            updates["awaiting_scheduling_confirmation"] = True
+            updates["response"] = format_confirmation_request(
+                parsed["datetime"], duration, title, attendees
+            )
+            updates["calendar_action"] = "pending_schedule"
+
+        elif any(word in query_lower for word in ["available", "free", "slot", "busy"]):
             result = await find_available_slots.ainvoke({
-                "date_range_start": "today",
+                "date_range_start": query,
                 "user_id": user_id,
             })
             updates["calendar_action"] = "check"
             updates["calendar_events"] = result.get("available_slots", [])
 
+            # Format availability response
+            slots = result.get("available_slots", [])
+            if slots:
+                updates["response"] = "**Available times:**\n" + "\n".join(
+                    f"- {s['start']}" for s in slots[:5]
+                )
+            else:
+                updates["response"] = "No available slots found for that time."
+
         else:
-            result = await check_calendar.ainvoke({
-                "date": "today",
-                "user_id": user_id,
-            })
+            result = await check_calendar.ainvoke({"date": query, "user_id": user_id})
             updates["calendar_action"] = "check"
             updates["calendar_events"] = result.get("events", [])
+
+            events = result.get("events", [])
+            if events:
+                updates["response"] = f"**Your calendar for {result.get('date', 'today')}:**\n" + "\n".join(
+                    f"- {e['title']} at {e['start_time']}" for e in events
+                )
+            else:
+                updates["response"] = f"No events scheduled for {result.get('date', 'today')}."
 
     except Exception as e:
         logger.error(f"Calendar error: {e}")
