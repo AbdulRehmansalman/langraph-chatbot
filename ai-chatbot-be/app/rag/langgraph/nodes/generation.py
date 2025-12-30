@@ -6,12 +6,13 @@ Generates responses using LLM with:
 - Context-grounded answers
 - Citation formatting
 - Streaming support
+- Intelligent appointment scheduling suggestions
 """
 
 import logging
 import re
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -84,6 +85,83 @@ FALLBACK_RESPONSES = {
 }
 
 FALLBACK_RESPONSE = FALLBACK_RESPONSES["default"]
+
+# Scheduling suggestion template
+SCHEDULING_SUGGESTION = (
+    "\n\n---\n"
+    "📅 **Would you like to schedule an appointment for this?**\n"
+    "Just reply **'yes'** and I'll help you book it."
+)
+
+
+def _should_suggest_scheduling(query: str, response: str, documents: list[dict]) -> bool:
+    """
+    Determine if we should suggest scheduling an appointment.
+
+    This works with ANY type of documents - medical, business, training, etc.
+    It detects if the user is asking about something that could be scheduled.
+
+    Args:
+        query: User's original query
+        response: Generated response
+        documents: Retrieved documents
+
+    Returns:
+        True if scheduling suggestion should be added
+    """
+    query_lower = query.lower()
+    response_lower = response.lower()
+
+    # Skip if query is too short or is a greeting
+    if len(query.split()) < 3:
+        return False
+
+    # Skip if already asking to schedule
+    scheduling_words = ["schedule", "book", "appointment", "reserve", "when can i"]
+    if any(word in query_lower for word in scheduling_words):
+        return False
+
+    # Patterns that indicate user is INQUIRING about something (not just chatting)
+    inquiry_patterns = [
+        r"(what|which|tell me|explain|describe|how|can you|do you|is there|are there)",
+        r"(about|offer|provide|available|options?|services?|tests?|packages?)",
+        r"\?$",  # Questions ending with ?
+    ]
+
+    is_inquiry = any(re.search(pattern, query_lower) for pattern in inquiry_patterns)
+    if not is_inquiry:
+        return False
+
+    # Check if response contains schedulable content indicators
+    # These are GENERIC patterns that work across any domain
+    schedulable_indicators = [
+        # Services and offerings
+        r"\b(service|test|package|plan|program|session|consultation)\b",
+        r"\b(appointment|visit|meeting|booking)\b",
+        r"\b(available|offered|provide|offer)\b",
+        # Actions that can be scheduled
+        r"\b(exam|examination|assessment|evaluation|check[-\s]?up)\b",
+        r"\b(training|workshop|demo|demonstration|trial)\b",
+        r"\b(treatment|procedure|therapy|course)\b",
+        # Time-related (indicates something can be scheduled)
+        r"\b(duration|takes|minutes|hours|weekly|daily|monthly)\b",
+        r"\b(schedule|timing|slots?|availability)\b",
+    ]
+
+    # Check in both response and documents
+    content_to_check = response_lower
+    for doc in documents[:3]:
+        content_to_check += " " + doc.get("content", "").lower()
+
+    matches = sum(1 for pattern in schedulable_indicators
+                  if re.search(pattern, content_to_check))
+
+    # If we find at least 2 schedulable indicators, suggest scheduling
+    if matches >= 2:
+        logger.info(f"Scheduling suggestion triggered: {matches} indicators found")
+        return True
+
+    return False
 
 
 def _extract_citations(response: str, documents: list[dict]) -> list[dict]:
@@ -188,9 +266,22 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
 
         logger.info(f"Generated response with {len(citations)} citations")
 
+        # Check if we should suggest scheduling an appointment
+        scheduling_suggested = False
+        if classification == "document" and documents:
+            if _should_suggest_scheduling(query, response, documents):
+                response += SCHEDULING_SUGGESTION
+                scheduling_suggested = True
+                logger.info("Added scheduling suggestion to response")
+
         updates["response"] = response
         updates["citations"] = citations
         updates["messages"] = [AIMessage(content=response)]
+        updates["scheduling_suggested"] = scheduling_suggested
+        updates["awaiting_scheduling_confirmation"] = scheduling_suggested  # Wait for "yes"
+        if scheduling_suggested:
+            # Store what the user was asking about for context
+            updates["scheduling_context"] = query[:200]
 
         # Update metrics
         input_tokens = estimate_tokens(system_prompt + query)

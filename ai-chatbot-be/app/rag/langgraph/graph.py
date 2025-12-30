@@ -83,12 +83,19 @@ DOCUMENT_PATTERNS = [
 DIRECT_ANSWER_PATTERNS = [
     r"^(thanks|thank\s+you|thx)[\s!.,]*$",
     r"^(ok|okay|sure|got\s+it|understood)[\s!.,]*$",
-    r"^(yes|no|yeah|nope|yep)[\s!.,]*$",
     r"^(bye|goodbye|see\s+you|later|ciao)[\s!.,]*$",
     r"^what\s+can\s+you\s+(do|help\s+with)",
     r"^(who|what)\s+are\s+you",
     r"^help\s*$",
     r"^(never\s*mind|forget\s+it|cancel)[\s!.,]*$",
+]
+
+# Scheduling confirmation patterns - user saying "yes" to schedule
+SCHEDULING_CONFIRMATION_PATTERNS = [
+    r"^(yes|yeah|yep|yup|sure|ok|okay)[\s!.,]*$",
+    r"^(yes\s*please|sure\s*thing|go\s*ahead)[\s!.,]*$",
+    r"^(i\s*want\s*to|let'?s\s*do\s*it|book\s*it)[\s!.,]*$",
+    r"^(schedule|book)\s*(it|that|one)?[\s!.,]*$",
 ]
 
 # Sensitive topics requiring human approval
@@ -132,7 +139,12 @@ def _match_patterns(text: str, patterns: list[str]) -> bool:
     return any(re.search(pattern, text_lower) for pattern in patterns)
 
 
-def classify_query_rules(query: str, has_documents: bool = False) -> tuple[str, str]:
+def _is_scheduling_confirmation(query: str) -> bool:
+    """Check if query is a confirmation to schedule an appointment."""
+    return _match_patterns(query, SCHEDULING_CONFIRMATION_PATTERNS)
+
+
+def classify_query_rules(query: str, has_documents: bool = False, awaiting_scheduling: bool = False) -> tuple[str, str]:
     """
     Rule-based query classification.
 
@@ -145,6 +157,11 @@ def classify_query_rules(query: str, has_documents: bool = False) -> tuple[str, 
     query_clean = query.strip()
     query_lower = query_clean.lower()
     word_count = len(query_clean.split())
+
+    # 0. Check for scheduling confirmation (if we're awaiting one)
+    if awaiting_scheduling and word_count <= 5:
+        if _is_scheduling_confirmation(query_clean):
+            return "scheduling_confirmation", "User confirmed scheduling"
 
     # 1. Check for greetings (ONLY short, simple greetings)
     if word_count <= 3 and _match_patterns(query_clean, GREETING_PATTERNS):
@@ -193,7 +210,7 @@ def classify_query_rules(query: str, has_documents: bool = False) -> tuple[str, 
 # ROUTING FUNCTIONS
 # =============================================================================
 
-def route_after_router(state: AgentState) -> Literal["document", "calendar", "greeting", "direct", "human_review", "error"]:
+def route_after_router(state: AgentState) -> Literal["document", "calendar", "greeting", "direct", "human_review", "scheduling_flow", "error"]:
     """
     Route based on query classification.
 
@@ -210,6 +227,9 @@ def route_after_router(state: AgentState) -> Literal["document", "calendar", "gr
 
     if classification == "direct":
         return "direct"
+
+    if classification == "scheduling_confirmation":
+        return "scheduling_flow"
 
     if classification == "human_approval":
         return "human_review"
@@ -267,11 +287,12 @@ async def router_node(state: AgentState) -> dict:
     """
     query = state.get("original_query", "")
     has_documents = bool(state.get("document_ids"))
+    awaiting_scheduling = state.get("awaiting_scheduling_confirmation", False)
 
     updates = track_node(state, "router")
 
     # Use rule-based classification (fast, no LLM call)
-    classification, reason = classify_query_rules(query, has_documents)
+    classification, reason = classify_query_rules(query, has_documents, awaiting_scheduling)
 
     # Optional: Use LLM for uncertain cases (when ROUTING_USE_LLM=true)
     if ROUTING_USE_LLM and classification == "general" and len(query.split()) > 3:
@@ -422,6 +443,37 @@ async def direct_node(state: AgentState) -> dict:
         # Fallback - shouldn't happen if patterns are correct
         updates["response"] = "How can I help you?"
         updates["should_end"] = False
+
+    return updates
+
+
+async def scheduling_flow_node(state: AgentState) -> dict:
+    """
+    Handle scheduling conversation when user confirms they want to book.
+
+    This node asks for appointment details (date, time, location).
+    """
+    user_name = state.get("user_name", "there")
+    scheduling_context = state.get("scheduling_context", "your appointment")
+
+    updates = track_node(state, "scheduling_flow")
+
+    # Ask for scheduling details
+    response = (
+        f"Great, {user_name}! I'd be happy to help you schedule an appointment.\n\n"
+        "📋 **Please provide the following details:**\n"
+        "- **Preferred date** (e.g., tomorrow, next Monday, January 15th)\n"
+        "- **Preferred time** (e.g., 10:00 AM, afternoon, 3pm)\n"
+        "- **Location preference** (if applicable)\n\n"
+        "For example: *'Tomorrow at 2pm at the main office'*"
+    )
+
+    updates["response"] = response
+    updates["should_end"] = False
+    updates["awaiting_scheduling_confirmation"] = False  # Reset - now awaiting details
+    updates["messages"] = [AIMessage(content=response)]
+
+    logger.info("Scheduling flow: Asked user for appointment details")
 
     return updates
 
@@ -588,6 +640,7 @@ class AgentGraphBuilder:
         workflow.add_node("calendar", calendar_node)
         workflow.add_node("greeting", greeting_node)
         workflow.add_node("direct", direct_node)  # Handles simple responses (thanks, bye, etc.)
+        workflow.add_node("scheduling_flow", scheduling_flow_node)  # Handles scheduling confirmation
         workflow.add_node("human_review", human_review_node)
         workflow.add_node("response", response_node)
         workflow.add_node("error", error_node)
@@ -608,6 +661,7 @@ class AgentGraphBuilder:
                 "calendar": "calendar",
                 "greeting": "greeting",
                 "direct": "direct",  # Only for: thanks, bye, ok, help, who are you
+                "scheduling_flow": "scheduling_flow",  # User confirmed scheduling
                 "human_review": "human_review",
                 "error": "error",
             }
@@ -636,6 +690,7 @@ class AgentGraphBuilder:
         )
 
         workflow.add_edge("greeting", END)
+        workflow.add_edge("scheduling_flow", END)  # Scheduling flow ends after asking for details
         workflow.add_edge("response", END)
         workflow.add_edge("error", END)
 
