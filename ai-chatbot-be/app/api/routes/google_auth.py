@@ -111,9 +111,8 @@ async def google_auth_callback(request: Request):
             "user_id": user_id,
             "access_token": credentials.token,
             "refresh_token": credentials.refresh_token,
-            "expires_at": credentials.expiry.isoformat() if credentials.expiry else None,
-            "scopes": credentials.scopes,
-            "token_type": "Bearer"
+            "token_expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+            "scopes": credentials.scopes
         }
         
         # Check if user already has Google auth

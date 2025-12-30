@@ -166,6 +166,11 @@ class AgentState(TypedDict, total=False):
     calendar_events: list[dict[str, Any]]  # CalendarEvent as dicts
     scheduled_meeting: Optional[dict[str, Any]]
 
+    # === Scheduling Flow ===
+    scheduling_suggested: bool  # True if scheduling was suggested in last response
+    awaiting_scheduling_confirmation: bool  # True if waiting for user to say "yes"
+    scheduling_context: Optional[str]  # What service/test the user asked about
+
     # === Response Generation ===
     response: str
     citations: list[dict[str, Any]]  # Citation as dicts
@@ -265,6 +270,11 @@ def create_initial_state(
         calendar_action=None,
         calendar_events=[],
         scheduled_meeting=None,
+
+        # Scheduling Flow
+        scheduling_suggested=False,
+        awaiting_scheduling_confirmation=False,
+        scheduling_context=None,
 
         # Response
         response="",
