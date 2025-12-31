@@ -14,13 +14,33 @@ from app.services.llm_factory import llm_factory
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# SHARED AGENT SINGLETON
+# =============================================================================
+# The agent must be shared across requests to preserve conversation state
+# via the MemorySaver checkpointer. Each request uses the same thread_id
+# to continue a conversation.
+
+_shared_agent = None
+_shared_agent_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+
+
+def _get_shared_agent():
+    """Get or create the shared agent singleton."""
+    global _shared_agent
+    if _shared_agent is None:
+        from app.rag.langgraph import create_agent
+        _shared_agent = create_agent()
+        logger.info("Created shared agent singleton for state persistence")
+    return _shared_agent
+
 
 class RAGChainAdapter:
     """
     Adapter that provides RAG chain-like interface using LangGraph agent.
 
     Usage:
-        chain = create_rag_chain(user_id="123")
+        chain = create_rag_chain(user_id="123", thread_id="conversation-123")
         response = await chain.invoke("What is the policy?")
 
         # Or streaming
@@ -32,17 +52,15 @@ class RAGChainAdapter:
         self,
         user_id: str,
         document_ids: Optional[list[str]] = None,
+        thread_id: Optional[str] = None,
     ):
         self.user_id = user_id
         self.document_ids = document_ids
-        self._agent = None
+        self.thread_id = thread_id
 
     def _get_agent(self):
-        """Lazy load the agent."""
-        if self._agent is None:
-            from app.rag.langgraph import create_agent
-            self._agent = create_agent()
-        return self._agent
+        """Get the shared agent singleton for state persistence."""
+        return _get_shared_agent()
 
     async def invoke(self, query: str) -> "RAGResponse":
         """
@@ -60,6 +78,7 @@ class RAGChainAdapter:
             query=query,
             user_id=self.user_id,
             document_ids=self.document_ids,
+            thread_id=self.thread_id,  # Pass thread_id for state persistence
         )
 
         return RAGResponse(
@@ -103,6 +122,7 @@ class RAGChainAdapter:
                         query=query,
                         user_id=self.user_id,
                         document_ids=self.document_ids,
+                        thread_id=self.thread_id,  # Pass thread_id for state persistence
                     )
                 )
 
@@ -156,6 +176,7 @@ class RAGResponse:
 def create_rag_chain(
     user_id: str,
     document_ids: Optional[list[str]] = None,
+    thread_id: Optional[str] = None,
 ) -> RAGChainAdapter:
     """
     Create a RAG chain for the given user.
@@ -163,11 +184,12 @@ def create_rag_chain(
     Args:
         user_id: User ID
         document_ids: Optional document IDs to search
+        thread_id: Thread ID for conversation continuity
 
     Returns:
         RAGChainAdapter instance
     """
-    return RAGChainAdapter(user_id=user_id, document_ids=document_ids)
+    return RAGChainAdapter(user_id=user_id, document_ids=document_ids, thread_id=thread_id)
 
 
 def get_llm_provider() -> str:

@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 from sqlalchemy.orm import Session
 import uuid
 from app.database.connection import SessionLocal
-from app.database.models import User, OTP, Document, DocumentChunk, ChatHistory, Meeting, UserGoogleAuth
+from app.database.models import User, OTP, Document, DocumentChunk, ChatHistory, Meeting, UserGoogleAuth, CalendarEvent
 
 
 class QueryResult:
@@ -42,6 +42,22 @@ class QueryBuilder:
         self._filters.append((column, "!=", value))
         return self
 
+    def gte(self, column: str, value: Any) -> "QueryBuilder":
+        self._filters.append((column, ">=", value))
+        return self
+
+    def lte(self, column: str, value: Any) -> "QueryBuilder":
+        self._filters.append((column, "<=", value))
+        return self
+
+    def gt(self, column: str, value: Any) -> "QueryBuilder":
+        self._filters.append((column, ">", value))
+        return self
+
+    def lt(self, column: str, value: Any) -> "QueryBuilder":
+        self._filters.append((column, "<", value))
+        return self
+
     def in_(self, column: str, values: List[Any]) -> "QueryBuilder":
         self._in_filters.append((column, values))
         return self
@@ -74,6 +90,14 @@ class QueryBuilder:
                     query = query.filter(col_attr == value)
                 elif op == "!=":
                     query = query.filter(col_attr != value)
+                elif op == ">=":
+                    query = query.filter(col_attr >= value)
+                elif op == "<=":
+                    query = query.filter(col_attr <= value)
+                elif op == ">":
+                    query = query.filter(col_attr > value)
+                elif op == "<":
+                    query = query.filter(col_attr < value)
 
         for column, values in self._in_filters:
             col_attr = getattr(self.model_class, column, None)
@@ -355,6 +379,7 @@ class DatabaseClient:
         "chat_history": ChatHistory,
         "meetings": Meeting,
         "user_google_auth": UserGoogleAuth,
+        "calendar_events": CalendarEvent,
     }
 
     def table(self, name: str) -> TableProxy:

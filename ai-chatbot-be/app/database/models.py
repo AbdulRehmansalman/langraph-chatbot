@@ -220,3 +220,38 @@ class UserGoogleAuth(Base):
             "scopes": self.scopes,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class CalendarEvent(Base):
+    __tablename__ = "calendar_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid_lib.uuid4)
+    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    title = Column(Text, nullable=False)
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    duration_minutes = Column(Integer, default=60)
+    description = Column(Text)
+    location = Column(Text)
+    participants = Column(JSONB, default=[])
+    status = Column(String(50), default="confirmed")
+    cancellation_reason = Column(Text)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "title": self.title,
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "duration_minutes": self.duration_minutes,
+            "description": self.description,
+            "location": self.location,
+            "participants": self.participants or [],
+            "status": self.status,
+            "cancellation_reason": self.cancellation_reason,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }

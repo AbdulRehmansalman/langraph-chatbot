@@ -170,6 +170,7 @@ class AgentState(TypedDict, total=False):
     scheduling_suggested: bool  # True if scheduling was suggested in last response
     awaiting_scheduling_confirmation: bool  # True if waiting for user to say "yes"
     scheduling_context: Optional[str]  # What service/test the user asked about
+    pending_schedule: Optional[dict[str, Any]]  # Pending meeting details awaiting confirmation
 
     # === Response Generation ===
     response: str
@@ -275,6 +276,7 @@ def create_initial_state(
         scheduling_suggested=False,
         awaiting_scheduling_confirmation=False,
         scheduling_context=None,
+        pending_schedule=None,
 
         # Response
         response="",
