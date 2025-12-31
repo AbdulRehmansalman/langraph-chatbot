@@ -189,9 +189,11 @@ async def stream_chat_response(
             }).to_sse()
 
             # Create RAG chain (auto-uses Bedrock in production)
+            # Pass thread_id for conversation state persistence
             rag_chain = create_rag_chain(
                 user_id=user_id,
-                document_ids=validated_doc_ids
+                document_ids=validated_doc_ids,
+                thread_id=message.thread_id,
             )
 
             # Create streaming manager with configured timeout

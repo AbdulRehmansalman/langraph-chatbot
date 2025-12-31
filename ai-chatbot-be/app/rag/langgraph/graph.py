@@ -4,15 +4,22 @@ LangGraph Agent
 
 Production-ready agent graph with:
 - Intelligent query routing (skip retrieval when unnecessary)
-- Tool execution
+- ReAct calendar agent with bound tools for real scheduling
+- Tool execution with proper error handling
 - Human-in-the-loop approval
 - Streaming support
 - PostgreSQL checkpointing
 
 Graph Structure:
-    entry → router → [document | calendar | general | direct] → response → END
+    entry → router → [document | calendar | direct] → response → END
                    ↘ greeting → END
+                   ↘ scheduling_flow → END (after user confirms)
                    ↘ human_review → response → END
+
+Calendar Agent:
+    - Uses ReAct pattern with bound tools (check_calendar, schedule_meeting, etc.)
+    - Scheduling requests require user confirmation before actual booking
+    - Tools return real results from database - no mock successes
 """
 
 import logging
@@ -21,9 +28,10 @@ import random
 import re
 from typing import Any, AsyncIterator, Literal, Optional
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
 
 from app.rag.langgraph.state import (
     AgentState,
@@ -36,6 +44,35 @@ from app.rag.langgraph.state import (
 )
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# USER-BASED PENDING SCHEDULE CACHE
+# =============================================================================
+# Fallback cache for pending_schedule when thread_id isn't passed
+# This ensures scheduling confirmation works even without proper thread_id
+_pending_schedule_cache: dict[str, dict] = {}
+
+
+def _cache_pending_schedule(user_id: str, pending: dict) -> None:
+    """Cache pending schedule for a user."""
+    if user_id:
+        _pending_schedule_cache[user_id] = pending
+        logger.info(f"Cached pending schedule for user {user_id}")
+
+
+def _get_cached_pending_schedule(user_id: str) -> dict | None:
+    """Get cached pending schedule for a user."""
+    if user_id and user_id in _pending_schedule_cache:
+        return _pending_schedule_cache[user_id]
+    return None
+
+
+def _clear_cached_pending_schedule(user_id: str) -> None:
+    """Clear cached pending schedule for a user."""
+    if user_id and user_id in _pending_schedule_cache:
+        del _pending_schedule_cache[user_id]
+        logger.info(f"Cleared pending schedule cache for user {user_id}")
+
 
 # Routing configuration
 ROUTING_USE_LLM = os.getenv("ROUTING_USE_LLM", "false").lower() == "true"
@@ -286,8 +323,33 @@ async def router_node(state: AgentState) -> dict:
     retrieval is always invoked for substantive queries.
     """
     query = state.get("original_query", "")
+    query_lower = query.lower().strip()
     has_documents = bool(state.get("document_ids"))
+    user_id = state.get("user_id")
+
+    logger.info(f"ROUTER: Processing query '{query}' for user {user_id}")
+
+    # Check if awaiting scheduling confirmation - first from state, then from cache
     awaiting_scheduling = state.get("awaiting_scheduling_confirmation", False)
+    cached_pending = None
+
+    if user_id:
+        cached_pending = _get_cached_pending_schedule(user_id)
+        if cached_pending:
+            logger.info(f"ROUTER: Found cached pending schedule for user {user_id}")
+            awaiting_scheduling = True
+
+    # DIRECT CHECK: If query is a simple confirmation AND we have cached pending schedule
+    # Route directly to scheduling_flow without going through classify_query_rules
+    confirmation_words = ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm", "book it", "go ahead"]
+    if cached_pending and query_lower in confirmation_words:
+        logger.info(f"ROUTER: Direct confirmation detected with cached pending - routing to scheduling_flow")
+        updates = track_node(state, "router")
+        updates["query_classification"] = "scheduling_confirmation"
+        updates["routing_reason"] = "Direct confirmation with cached pending schedule"
+        _routing_stats["total"] += 1
+        _routing_stats["scheduling_confirmation"] = _routing_stats.get("scheduling_confirmation", 0) + 1
+        return updates
 
     updates = track_node(state, "router")
 
@@ -452,46 +514,67 @@ async def scheduling_flow_node(state: AgentState) -> dict:
     Complete booking when user confirms with 'yes'.
 
     This node reads the pending_schedule from state and actually creates the meeting.
+    Falls back to user-based cache if state doesn't have pending_schedule.
     """
     from app.rag.langgraph.tools.appointment_tools import (
         schedule_meeting,
         format_meeting_success,
     )
+    from dateutil import parser as date_parser
 
     updates = track_node(state, "scheduling_flow")
+    user_id = state.get("user_id")
+
+    logger.info(f"SCHEDULING_FLOW_NODE: Starting for user {user_id}")
+
+    # Try to get pending schedule from state first, then fallback to cache
     pending = state.get("pending_schedule")
+    if not pending and user_id:
+        pending = _get_cached_pending_schedule(user_id)
+        if pending:
+            logger.info(f"SCHEDULING_FLOW_NODE: Using cached pending schedule: {pending}")
 
     if not pending:
         # No pending meeting - ask what they want to book
-        updates["response"] = "No pending meeting to schedule. What would you like to book?"
+        logger.warning("SCHEDULING_FLOW_NODE: No pending schedule found!")
+        updates["response"] = "I don't have a pending appointment to book. What would you like to schedule?"
         updates["should_end"] = False
         updates["messages"] = [AIMessage(content=updates["response"])]
         return updates
+
+    logger.info(f"SCHEDULING_FLOW_NODE: Scheduling - title={pending.get('title')}, datetime={pending.get('datetime')}")
 
     # Actually create the meeting
     try:
         result = await schedule_meeting.ainvoke({
             "title": pending["title"],
             "datetime_str": pending["datetime"],
-            "duration_minutes": pending["duration"],
+            "duration_minutes": pending.get("duration", 60),
             "participants": pending.get("attendees"),
             "user_id": pending.get("user_id"),
         })
+
+        logger.info(f"SCHEDULING_FLOW_NODE: schedule_meeting result: {result}")
 
         if result.get("success"):
             updates["scheduled_meeting"] = result
             updates["response"] = format_meeting_success(result)
             logger.info(f"Meeting scheduled successfully: {result.get('meeting_id')}")
         else:
-            updates["response"] = f"Could not schedule: {result.get('message', 'Unknown error')}"
+            error_msg = result.get('message') or result.get('error') or 'Unknown error'
+            updates["response"] = f"Sorry, I couldn't schedule the appointment: {error_msg}"
             if result.get("alternative_slots"):
-                updates["response"] += "\n\n**Alternative times:**\n"
+                updates["response"] += "\n\n**Alternative times available:**\n"
                 for slot in result["alternative_slots"][:3]:
-                    updates["response"] += f"- {slot['start']}\n"
+                    try:
+                        slot_dt = date_parser.parse(slot['start'])
+                        updates["response"] += f"- {slot_dt.strftime('%A, %B %d at %I:%M %p')}\n"
+                    except Exception:
+                        updates["response"] += f"- {slot['start']}\n"
 
     except Exception as e:
-        logger.error(f"Scheduling error: {e}")
-        updates["response"] = f"Error scheduling meeting: {str(e)}"
+        logger.error(f"SCHEDULING_FLOW_NODE: Error - {e}", exc_info=True)
+        updates["response"] = f"I encountered an error while scheduling: {str(e)}. Please try again."
 
     # Clear pending state
     updates["pending_schedule"] = None
@@ -499,7 +582,11 @@ async def scheduling_flow_node(state: AgentState) -> dict:
     updates["should_end"] = True
     updates["messages"] = [AIMessage(content=updates["response"])]
 
-    logger.info("Scheduling flow: Completed booking")
+    # Clear the user cache as well
+    if user_id:
+        _clear_cached_pending_schedule(user_id)
+
+    logger.info(f"SCHEDULING_FLOW_NODE: Completed with response: {updates['response'][:100]}...")
 
     return updates
 
@@ -536,93 +623,228 @@ async def document_node(state: AgentState) -> dict:
     return result
 
 
+def _get_calendar_tools():
+    """Get all calendar tools for the agent."""
+    from app.rag.langgraph.tools.appointment_tools import (
+        check_calendar,
+        schedule_meeting,
+        reschedule_meeting,
+        cancel_meeting,
+        find_available_slots,
+        send_invites,
+        set_reminder,
+    )
+    return [
+        check_calendar,
+        schedule_meeting,
+        reschedule_meeting,
+        cancel_meeting,
+        find_available_slots,
+        send_invites,
+        set_reminder,
+    ]
+
+
+def _get_calendar_agent():
+    """Create a ReAct agent for calendar operations with bound tools."""
+    from app.services.llm_factory import llm_factory
+
+    # Get calendar tools
+    tools = _get_calendar_tools()
+
+    # Create LLM with zero temperature for reliability (important for Ollama/llama3.1)
+    llm = llm_factory.create_llm(temperature=0.0, max_tokens=2048)
+
+    # Create ReAct agent with tools
+    # Note: Dynamic context (date, history) is injected in calendar_node before invoking
+    agent = create_react_agent(llm, tools)
+
+    return agent
+
+
+def _get_calendar_system_prompt(current_date: str, chat_history: str) -> str:
+    """Get the calendar agent system prompt with dynamic values."""
+    return f"""You are a precise calendar assistant for scheduling lab tests and appointments.
+
+CONTEXT:
+- User's documents mention services like CBC (Complete Blood Count test, price $25, report 2-4 hours).
+- Today's date: {current_date}
+- Parse dates relative to today (e.g., 'tomorrow' = next day, 'at 3pm' = 15:00).
+
+CRITICAL RULES:
+- ALWAYS use tools to check availability, schedule, or view calendar.
+- NEVER assume or hallucinate success - you MUST actually call tools.
+- Use 60 minutes default duration for tests like CBC unless specified.
+- Title format: Use descriptive titles like "CBC - Complete Blood Count Test".
+- If unclear, ask for clarification (e.g., date/time).
+
+STEP-BY-STEP PROCESS:
+1. Understand request: Is it scheduling, checking calendar, or finding availability?
+2. Parse details: Extract title, datetime (ISO format), duration from the request.
+3. Use tools: Call check_calendar first for conflicts, then schedule_meeting.
+4. On tool error (success=False): Report honestly (e.g., "Couldn't save - database issue").
+5. Respond concisely with the actual tool result.
+
+CHAT HISTORY FOR CONTEXT:
+{chat_history}
+(Use this to resolve references like 'it' or 'the test' from previous messages)"""
+
+
+# Cache the agent to avoid recreating it each time
+_calendar_agent_cache = None
+
+
+def get_calendar_agent():
+    """Get or create the calendar agent (cached)."""
+    global _calendar_agent_cache
+    if _calendar_agent_cache is None:
+        _calendar_agent_cache = _get_calendar_agent()
+    return _calendar_agent_cache
+
+
 async def calendar_node(state: AgentState) -> dict:
-    """Handle calendar/appointment queries with NLP parsing."""
+    """
+    Handle calendar/appointment queries using a ReAct agent with tools.
+
+    The agent will:
+    1. Parse the user's calendar request
+    2. Use appropriate tools (check_calendar, schedule_meeting, etc.)
+    3. Return actual results from tool execution
+    """
     from app.rag.langgraph.tools.appointment_tools import (
         parse_natural_datetime_enhanced,
         extract_duration,
         extract_attendees,
         extract_meeting_title,
         format_confirmation_request,
-        check_calendar,
-        schedule_meeting,
-        find_available_slots,
     )
 
     query = state.get("original_query", "")
     user_id = state.get("user_id")
     timezone = state.get("timezone", "UTC")
+    user_name = state.get("user_name", "User")
 
     updates = track_node(state, "calendar")
 
     try:
         query_lower = query.lower()
 
-        if any(word in query_lower for word in ["schedule", "book", "create", "set up"]):
-            # Parse datetime from ACTUAL user query (not hardcoded!)
+        # Check if this looks like a datetime input (follow-up to previous scheduling request)
+        datetime_keywords = ["tomorrow", "today", "tonight", "monday", "tuesday", "wednesday",
+                            "thursday", "friday", "saturday", "sunday", "next", "at ", "pm", "am",
+                            "morning", "afternoon", "evening", "in 1", "in 2", "in 3"]
+        is_datetime_input = any(kw in query_lower for kw in datetime_keywords)
+
+        # Check if this is a scheduling request OR a datetime follow-up
+        is_scheduling_request = any(word in query_lower for word in ["schedule", "book", "create", "set up"])
+
+        # Get scheduling context from previous messages (for follow-up datetime inputs)
+        scheduling_context = state.get("scheduling_context", "")
+
+        # If it's a scheduling request OR looks like a datetime input (possible follow-up)
+        if is_scheduling_request or (is_datetime_input and not any(word in query_lower for word in ["available", "free", "check", "what", "show"])):
+            # Parse datetime from user query
             parsed = parse_natural_datetime_enhanced(query, timezone)
 
             if not parsed["datetime"]:
+                # Store context for follow-up
+                updates["scheduling_context"] = query
                 updates["response"] = (
                     "I couldn't understand the date/time. Please specify like:\n"
                     "- 'tomorrow at 2pm'\n"
                     "- 'next Monday at 10:30am'\n"
                     "- 'in 2 hours'"
                 )
-                updates["should_end"] = True
+                updates["messages"] = [AIMessage(content=updates["response"])]
                 return updates
 
             duration = extract_duration(query)
             attendees = extract_attendees(query)
+
+            # Extract title from current query OR use context from previous message
             title = extract_meeting_title(query)
+            if title == "Meeting" and scheduling_context:
+                # Try to get a better title from previous context
+                title = extract_meeting_title(scheduling_context)
 
             # Store pending schedule for confirmation
-            updates["pending_schedule"] = {
+            pending_schedule = {
                 "datetime": parsed["datetime"].isoformat(),
                 "duration": duration,
                 "attendees": attendees,
                 "title": title,
                 "user_id": user_id,
             }
+            updates["pending_schedule"] = pending_schedule
             updates["awaiting_scheduling_confirmation"] = True
             updates["response"] = format_confirmation_request(
                 parsed["datetime"], duration, title, attendees
             )
             updates["calendar_action"] = "pending_schedule"
+            updates["messages"] = [AIMessage(content=updates["response"])]
 
-        elif any(word in query_lower for word in ["available", "free", "slot", "busy"]):
-            result = await find_available_slots.ainvoke({
-                "date_range_start": query,
-                "user_id": user_id,
-            })
-            updates["calendar_action"] = "check"
-            updates["calendar_events"] = result.get("available_slots", [])
+            # Also cache by user_id as fallback for when thread_id isn't preserved
+            _cache_pending_schedule(user_id, pending_schedule)
 
-            # Format availability response
-            slots = result.get("available_slots", [])
-            if slots:
-                updates["response"] = "**Available times:**\n" + "\n".join(
-                    f"- {s['start']}" for s in slots[:5]
-                )
-            else:
-                updates["response"] = "No available slots found for that time."
+            return updates
 
-        else:
-            result = await check_calendar.ainvoke({"date": query, "user_id": user_id})
-            updates["calendar_action"] = "check"
-            updates["calendar_events"] = result.get("events", [])
+        # For non-scheduling queries, use the ReAct agent with tools
+        agent = get_calendar_agent()
 
-            events = result.get("events", [])
-            if events:
-                updates["response"] = f"**Your calendar for {result.get('date', 'today')}:**\n" + "\n".join(
-                    f"- {e['title']} at {e['start_time']}" for e in events
-                )
-            else:
-                updates["response"] = f"No events scheduled for {result.get('date', 'today')}."
+        # Prepare context for the agent
+        from datetime import datetime
+        current_date = datetime.now().strftime("%Y-%m-%d")
+
+        # Build chat history from state messages for context
+        state_messages = state.get("messages", [])
+        chat_history = ""
+        if state_messages:
+            recent = state_messages[-5:] if len(state_messages) > 5 else state_messages
+            for msg in recent:
+                role = "User" if hasattr(msg, "type") and msg.type == "human" else "Assistant"
+                content = msg.content if hasattr(msg, "content") else str(msg)
+                chat_history += f"{role}: {content[:200]}\n"
+        if not chat_history:
+            chat_history = "(No previous messages)"
+
+        # Get the optimized system prompt with dynamic values
+        system_prompt = _get_calendar_system_prompt(current_date, chat_history)
+
+        # Create messages for the agent with system prompt
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"""User: {user_name}
+User ID: {user_id}
+Timezone: {timezone}
+
+User request: {query}
+
+Use the appropriate calendar tools to handle this request.""")
+        ]
+
+        # Invoke the agent
+        result = await agent.ainvoke({"messages": messages})
+
+        # Extract the final response from agent output
+        agent_messages = result.get("messages", [])
+        if agent_messages:
+            # Get the last AI message as the response
+            for msg in reversed(agent_messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    updates["response"] = msg.content
+                    break
+
+        if not updates.get("response"):
+            updates["response"] = "I processed your calendar request but couldn't generate a response."
+
+        updates["calendar_action"] = "agent_handled"
+        updates["messages"] = [AIMessage(content=updates["response"])]
 
     except Exception as e:
-        logger.error(f"Calendar error: {e}")
+        logger.error(f"Calendar agent error: {e}")
         updates.update(add_error(state, "calendar", "CALENDAR_ERROR", str(e)))
+        updates["response"] = f"Sorry, I encountered an error processing your calendar request: {str(e)}"
+        updates["messages"] = [AIMessage(content=updates["response"])]
 
     return updates
 
@@ -741,10 +963,12 @@ class AgentGraphBuilder:
         # Document retrieval MUST complete before response
         workflow.add_edge("document", "response")
 
+        # Calendar node handles its own response - route to END directly
+        # Only go to human_review for cancel/reschedule operations
         workflow.add_conditional_edges(
             "calendar",
-            lambda s: "human_review" if should_require_approval(s) else "response",
-            {"human_review": "human_review", "response": "response"}
+            lambda s: "human_review" if should_require_approval(s) else END,
+            {"human_review": "human_review", END: END}
         )
 
         # Direct node can end or continue based on should_end flag
@@ -835,16 +1059,32 @@ class Agent:
                     "from_cache": True,
                 }
 
-        initial_state = create_initial_state(
-            query=query,
-            user_id=user_id,
-            user_name=user_name,
-            document_ids=document_ids,
-            thread_id=thread_id,
-        )
+        # For continuing conversations, only pass minimal input to preserve state
+        # The checkpointer will load previous state (pending_schedule, etc.)
+        from langchain_core.messages import HumanMessage
+        from uuid import uuid4
 
-        config = {"configurable": {"thread_id": initial_state["thread_id"]}}
-        result = await self._graph.ainvoke(initial_state, config)
+        effective_thread_id = thread_id or str(uuid4())
+
+        # Log thread_id for debugging state persistence
+        if thread_id:
+            logger.info(f"Continuing conversation with thread_id: {thread_id}")
+        else:
+            logger.warning(f"No thread_id provided - creating new: {effective_thread_id}. State won't persist!")
+
+        # Minimal input - only what changes between messages
+        # This allows checkpointer to preserve pending_schedule, awaiting_confirmation, etc.
+        input_state = {
+            "messages": [HumanMessage(content=query)],
+            "original_query": query,
+            "user_id": user_id,
+            "user_name": user_name or "User",
+            "document_ids": document_ids,
+            "thread_id": effective_thread_id,
+        }
+
+        config = {"configurable": {"thread_id": effective_thread_id}}
+        result = await self._graph.ainvoke(input_state, config)
 
         response_data = {
             "response": result.get("response", ""),

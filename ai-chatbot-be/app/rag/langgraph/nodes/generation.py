@@ -6,7 +6,7 @@ Generates responses using LLM with:
 - Context-grounded answers
 - Citation formatting
 - Streaming support
-- Intelligent appointment scheduling suggestions
+- Intelligent appointment scheduling suggestions (now powered by LLM classifier)
 """
 
 import logging
@@ -50,24 +50,24 @@ RULES:
 
 Context:
 {context}""",
-
     "calendar": """You are a helpful assistant that manages calendar and appointments.
 
 Based on the calendar information provided, help the user with their request.
 
 Calendar Context:
 {context}""",
-
     "general": """You are a helpful AI assistant.
 Be conversational, accurate, and helpful.
 
 {context}""",
 }
 
-RESPONSE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "{system_prompt}"),
-    ("human", "{question}"),
-])
+RESPONSE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", "{system_prompt}"),
+        ("human", "{question}"),
+    ]
+)
 
 FALLBACK_RESPONSES = {
     "NO_DOCUMENTS": (
@@ -75,8 +75,7 @@ FALLBACK_RESPONSES = {
         "Please upload some documents first, and then I'll be able to answer your questions."
     ),
     "NO_EMBEDDINGS": (
-        "Your documents are still being processed. "
-        "Please wait a moment and try again."
+        "Your documents are still being processed. " "Please wait a moment and try again."
     ),
     "default": (
         "I couldn't find relevant information in your documents to answer that question. "
@@ -94,74 +93,109 @@ SCHEDULING_SUGGESTION = (
 )
 
 
-def _should_suggest_scheduling(query: str, response: str, documents: list[dict]) -> bool:
+# === NEW: LLM-BASED SCHEDULING INTENT CLASSIFIER ===
+SCHEDULING_CLASSIFIER_PROMPT = ChatPromptTemplate.from_template(
+    """You are an expert at detecting user interest in scheduling appointments, consultations, services, or bookings.
+
+User query: {query}
+
+Assistant response: {response}
+
+Relevant document excerpts:
+{snippets}
+
+Does this conversation indicate the user is inquiring about something that can be scheduled (e.g., medical test, consultation, training session, service package, treatment, etc.)?
+
+Answer with ONLY "yes" or "no". No explanation."""
+)
+
+
+async def _should_suggest_scheduling_llm(
+    query: str, response: str, documents: list[dict], fallback: bool = True
+) -> bool:
     """
-    Determine if we should suggest scheduling an appointment.
+    Use a lightweight LLM to classify if scheduling should be suggested.
+    Falls back to original regex method if needed.
+    """
+    try:
+        from app.services.llm_factory import llm_factory
 
-    This works with ANY type of documents - medical, business, training, etc.
-    It detects if the user is asking about something that could be scheduled.
+        # Use the default LLM for classification (Ollama in dev, Bedrock in prod)
+        classifier_llm = llm_factory.create_llm(
+            temperature=0.0,  # Low temp for deterministic classification
+            max_tokens=50,
+        )
 
-    Args:
-        query: User's original query
-        response: Generated response
-        documents: Retrieved documents
+        # Prepare concise snippets (top 4 docs, truncated)
+        snippets = "\n---\n".join(
+            [doc.get("content", "")[:600] for doc in documents[:4] if doc.get("content")]
+        )
+        if not snippets.strip():
+            snippets = "No relevant document content."
 
-    Returns:
-        True if scheduling suggestion should be added
+        chain = SCHEDULING_CLASSIFIER_PROMPT | classifier_llm | StrOutputParser()
+
+        result = await chain.ainvoke(
+            {
+                "query": query.strip(),
+                "response": response.strip(),
+                "snippets": snippets,
+            }
+        )
+
+        decision = result.strip().lower()
+        is_yes = "yes" in decision
+
+        logger.info(f"LLM Scheduling Classifier result: '{result.strip()}' → Suggest: {is_yes}")
+
+        return is_yes
+
+    except Exception as e:
+        logger.warning(f"LLM scheduling classifier failed: {e}. Falling back to regex method.")
+        if fallback:
+            return _should_suggest_scheduling_regex(query, response, documents)
+        return False
+
+
+def _should_suggest_scheduling_regex(query: str, response: str, documents: list[dict]) -> bool:
+    """
+    Original regex-based fallback method (kept as safety net).
+    Improved with broader patterns and lower threshold.
     """
     query_lower = query.lower()
     response_lower = response.lower()
 
-    # Skip if query is too short or is a greeting
     if len(query.split()) < 3:
         return False
 
-    # Skip if already asking to schedule
-    scheduling_words = ["schedule", "book", "appointment", "reserve", "when can i"]
+    scheduling_words = ["schedule", "book", "appointment", "reserve", "when can i", "slot"]
     if any(word in query_lower for word in scheduling_words):
-        return False
+        return False  # Already asking to schedule
 
-    # Patterns that indicate user is INQUIRING about something (not just chatting)
-    inquiry_patterns = [
-        r"(what|which|tell me|explain|describe|how|can you|do you|is there|are there)",
-        r"(about|offer|provide|available|options?|services?|tests?|packages?)",
-        r"\?$",  # Questions ending with ?
-    ]
-
-    is_inquiry = any(re.search(pattern, query_lower) for pattern in inquiry_patterns)
-    if not is_inquiry:
-        return False
-
-    # Check if response contains schedulable content indicators
-    # These are GENERIC patterns that work across any domain
+    # Broad indicators of schedulable services
     schedulable_indicators = [
-        # Services and offerings
-        r"\b(service|test|package|plan|program|session|consultation)\b",
-        r"\b(appointment|visit|meeting|booking)\b",
-        r"\b(available|offered|provide|offer)\b",
-        # Actions that can be scheduled
-        r"\b(exam|examination|assessment|evaluation|check[-\s]?up)\b",
-        r"\b(training|workshop|demo|demonstration|trial)\b",
-        r"\b(treatment|procedure|therapy|course)\b",
-        # Time-related (indicates something can be scheduled)
-        r"\b(duration|takes|minutes|hours|weekly|daily|monthly)\b",
-        r"\b(schedule|timing|slots?|availability)\b",
+        r"\b(service|test|package|plan|program|session|consultation|procedure|therapy|course|treatment|check.?up|exam|scan|assessment|evaluation)\b",
+        r"\b(appointment|visit|booking|reservation|slot|availability)\b",
+        r"\b(available|offered|provide|offer|includes?|covers?)\b",
+        r"\b(duration|time|minutes|hours|session.?length)\b",
+        r"\b(price|cost|fee|charge)\b",
     ]
 
-    # Check in both response and documents
     content_to_check = response_lower
-    for doc in documents[:3]:
+    for doc in documents[:6]:  # Check more docs
         content_to_check += " " + doc.get("content", "").lower()
 
-    matches = sum(1 for pattern in schedulable_indicators
-                  if re.search(pattern, content_to_check))
+    matches = sum(
+        1
+        for pattern in schedulable_indicators
+        if re.search(pattern, content_to_check, re.IGNORECASE)
+    )
 
-    # If we find at least 2 schedulable indicators, suggest scheduling
-    if matches >= 2:
-        logger.info(f"Scheduling suggestion triggered: {matches} indicators found")
-        return True
+    triggered = matches >= 1  # Lowered threshold
+    if triggered:
+        logger.info(f"Regex fallback triggered scheduling suggestion ({matches} matches)")
 
-    return False
+    return triggered
 
 
 def _extract_citations(response: str, documents: list[dict]) -> list[dict]:
@@ -176,25 +210,21 @@ def _extract_citations(response: str, documents: list[dict]) -> list[dict]:
         if index not in seen_indices and 0 < index <= len(documents):
             seen_indices.add(index)
             doc = documents[index - 1]
-            citations.append(Citation(
-                index=index,
-                document_id=doc.get("id", ""),
-                source=doc.get("source", "Unknown"),
-                snippet=doc.get("content", "")[:200],
-            ).model_dump())
+            citations.append(
+                Citation(
+                    index=index,
+                    document_id=doc.get("id", ""),
+                    source=doc.get("source", "Unknown"),
+                    snippet=doc.get("content", "")[:200],
+                ).model_dump()
+            )
 
     return citations
 
 
 async def generation_node(state: AgentState) -> dict[str, Any]:
     """
-    Generate response using LLM.
-
-    Args:
-        state: Current agent state
-
-    Returns:
-        Updated state with generated response
+    Generate response using LLM with improved scheduling suggestion logic.
     """
     start_time = time.time()
 
@@ -205,37 +235,24 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
     error_log = state.get("error_log", [])
     user_id = state.get("user_id")
 
-    # DIAGNOSTIC LOGGING - trace what generation receives
     logger.info("=" * 50)
     logger.info("GENERATION NODE - STATE RECEIVED")
     logger.info(f"  Query: {query[:80]}...")
     logger.info(f"  Classification: {classification}")
-    logger.info(f"  User ID: {user_id}")
     logger.info(f"  Documents received: {len(documents)}")
     logger.info(f"  Context length: {len(context)} chars")
-    logger.info(f"  Error log entries: {len(error_log)}")
-    if error_log:
-        for err in error_log:
-            logger.info(f"    - {err.get('error_type')}: {err.get('message', '')[:50]}")
     logger.info("=" * 50)
 
     updates = track_node(state, "generation")
 
-    # Handle no context for document queries
+    # Handle no documents
     if classification == "document" and not documents:
-        logger.warning("=" * 50)
         logger.warning("NO DOCUMENTS - RETURNING FALLBACK")
-        logger.warning(f"  Reason: classification={classification}, documents={len(documents)}")
-        logger.warning("=" * 50)
-
-        # Check error log for specific error types to provide better responses
         fallback_response = FALLBACK_RESPONSE
-
         for error in error_log:
             error_type = error.get("error_type", "")
             if error_type in FALLBACK_RESPONSES:
                 fallback_response = FALLBACK_RESPONSES[error_type]
-                logger.info(f"  Using specific fallback for: {error_type}")
                 break
 
         updates["response"] = fallback_response
@@ -245,56 +262,68 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
 
     try:
         from app.services.llm_factory import llm_factory
+
         llm = llm_factory.create_llm()
 
-        # Select prompt based on classification
-        system_prompt = SYSTEM_PROMPTS.get(
-            classification,
-            SYSTEM_PROMPTS["general"]
-        ).format(context=context)
+        system_prompt = SYSTEM_PROMPTS.get(classification, SYSTEM_PROMPTS["general"]).format(
+            context=context
+        )
 
         chain = RESPONSE_PROMPT | llm | StrOutputParser()
-        response = await chain.ainvoke({
-            "system_prompt": system_prompt,
-            "question": query,
-        })
+        response = await chain.ainvoke(
+            {
+                "system_prompt": system_prompt,
+                "question": query,
+            }
+        )
 
-        # Extract citations for document queries
+        # Extract citations
         citations = []
         if classification == "document" and documents:
             citations = _extract_citations(response, documents)
 
         logger.info(f"Generated response with {len(citations)} citations")
 
-        # Check if we should suggest scheduling an appointment
+        # === IMPROVED SCHEDULING SUGGESTION LOGIC ===
         scheduling_suggested = False
-        if classification == "document" and documents:
-            if _should_suggest_scheduling(query, response, documents):
-                response += SCHEDULING_SUGGESTION
-                scheduling_suggested = True
-                logger.info("Added scheduling suggestion to response")
+        if classification == "document" and documents and len(query.strip()) > 0:
+            try:
+                scheduling_suggested = await _should_suggest_scheduling_llm(
+                    query=query,
+                    response=response,
+                    documents=documents,
+                    fallback=True,  # Use regex if LLM fails
+                )
+
+                if scheduling_suggested:
+                    response += SCHEDULING_SUGGESTION
+                    logger.info("Added scheduling suggestion (LLM or regex triggered)")
+            except Exception as e:
+                logger.error(f"Scheduling suggestion decision failed: {e}")
+                scheduling_suggested = False
 
         updates["response"] = response
         updates["citations"] = citations
         updates["messages"] = [AIMessage(content=response)]
         updates["scheduling_suggested"] = scheduling_suggested
-        updates["awaiting_scheduling_confirmation"] = scheduling_suggested  # Wait for "yes"
+        updates["awaiting_scheduling_confirmation"] = scheduling_suggested
         if scheduling_suggested:
-            # Store what the user was asking about for context
             updates["scheduling_context"] = query[:200]
 
-        # Update metrics
+        # Metrics
         input_tokens = estimate_tokens(system_prompt + query)
         output_tokens = estimate_tokens(response)
         duration_ms = (time.time() - start_time) * 1000
 
-        updates.update(update_metrics(
-            state,
-            llm_calls=1,
-            tokens_in=input_tokens,
-            tokens_out=output_tokens,
-            duration_ms=duration_ms,
-        ))
+        updates.update(
+            update_metrics(
+                state,
+                llm_calls=1 + (1 if scheduling_suggested else 0),  # +1 if classifier ran
+                tokens_in=input_tokens,
+                tokens_out=output_tokens,
+                duration_ms=duration_ms,
+            )
+        )
 
     except Exception as e:
         logger.error(f"Generation error: {e}")
@@ -312,12 +341,7 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
 async def stream_generation(state: AgentState) -> AsyncIterator[dict[str, Any]]:
     """
     Stream response generation token by token.
-
-    Args:
-        state: Current agent state
-
-    Yields:
-        Token updates and final state
+    Scheduling suggestion added at the end.
     """
     logger.info("Starting streaming generation")
 
@@ -326,41 +350,60 @@ async def stream_generation(state: AgentState) -> AsyncIterator[dict[str, Any]]:
     context = get_response_context(state)
     documents = state.get("documents", [])
 
-    # Handle no context
     if classification == "document" and not documents:
         yield {"token": FALLBACK_RESPONSE, "done": True}
         return
 
     try:
         from app.services.llm_factory import llm_factory
+
         llm = llm_factory.create_llm()
 
-        system_prompt = SYSTEM_PROMPTS.get(
-            classification,
-            SYSTEM_PROMPTS["general"]
-        ).format(context=context)
+        system_prompt = SYSTEM_PROMPTS.get(classification, SYSTEM_PROMPTS["general"]).format(
+            context=context
+        )
 
         chain = RESPONSE_PROMPT | llm
 
         full_response = ""
-        async for chunk in chain.astream({
-            "system_prompt": system_prompt,
-            "question": query,
-        }):
+        async for chunk in chain.astream(
+            {
+                "system_prompt": system_prompt,
+                "question": query,
+            }
+        ):
             token = chunk.content if hasattr(chunk, "content") else str(chunk)
             full_response += token
             yield {"token": token, "done": False}
 
-        # Final yield with citations
-        citations = []
+        # Add scheduling suggestion if needed
+        scheduling_suggested = False
         if classification == "document" and documents:
-            citations = _extract_citations(full_response, documents)
+            try:
+                scheduling_suggested = await _should_suggest_scheduling_llm(
+                    query=query, response=full_response, documents=documents, fallback=True
+                )
+                if scheduling_suggested:
+                    full_response += SCHEDULING_SUGGESTION
+                    # Stream the suggestion
+                    for token in SCHEDULING_SUGGESTION:
+                        yield {"token": token, "done": False}
+            except Exception as e:
+                logger.error(f"Streaming scheduling suggestion failed: {e}")
+
+        # Final yield
+        citations = (
+            _extract_citations(full_response, documents)
+            if classification == "document" and documents
+            else []
+        )
 
         yield {
             "token": "",
             "done": True,
             "full_response": full_response,
             "citations": citations,
+            "scheduling_suggested": scheduling_suggested,
         }
 
     except Exception as e:

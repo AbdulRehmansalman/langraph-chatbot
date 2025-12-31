@@ -32,6 +32,45 @@ logger = logging.getLogger(__name__)
 # NLP HELPER FUNCTIONS
 # =============================================================================
 
+def _extract_datetime_portion(text: str) -> str:
+    """
+    Extract the datetime portion from text that may contain other words.
+
+    Examples:
+    - "Schedule CBC tomorrow at 3pm" → "tomorrow at 3pm"
+    - "Book a meeting for next Monday at 10am" → "next Monday at 10am"
+    - "tomorrow at 2pm" → "tomorrow at 2pm"
+    """
+    text_lower = text.lower()
+
+    # Common datetime patterns to extract
+    datetime_patterns = [
+        # "tomorrow/today/tonight at TIME"
+        r'(today|tomorrow|tonight)\s+(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm)?',
+        # "next DAY at TIME"
+        r'next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)\s+(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm)?',
+        # "DAY at TIME"
+        r'(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm)?',
+        # "in X hours/minutes"
+        r'in\s+\d+\s*(hours?|minutes?|mins?|hrs?)',
+        # "at TIME" with optional date
+        r'(on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?\s+(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm)?',
+        # Simple "tomorrow/today" without time
+        r'\b(today|tomorrow|tonight)\b',
+        # "next DAY" without time
+        r'next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)',
+        # Just time "at 3pm" or "3pm"
+        r'(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm)',
+    ]
+
+    for pattern in datetime_patterns:
+        match = re.search(pattern, text_lower, re.IGNORECASE)
+        if match:
+            return match.group(0)
+
+    return text
+
+
 def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
     """
     Enhanced NLP date parsing using dateparser library.
@@ -42,21 +81,33 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
     - "in 2 hours"
     - "Friday afternoon"
     - "December 31st at 5pm"
+    - "Schedule CBC tomorrow at 3pm" (extracts datetime portion)
 
     Returns:
-        dict with keys: datetime, confidence, ambiguous
+        dict with keys: datetime, confidence, ambiguous, timezone
     """
+    text_lower = text.lower()
+
     if DATEPARSER_AVAILABLE:
         settings = {
             'TIMEZONE': timezone,
             'RETURN_AS_TIMEZONE_AWARE': True,
             'PREFER_DATES_FROM': 'future',
+            'RELATIVE_BASE': datetime.now(),  # Use current time as base
         }
+
+        # First try the full text
         parsed = dateparser.parse(text, settings=settings)
+
+        # If that fails, try extracting just the datetime portion
+        if not parsed:
+            datetime_portion = _extract_datetime_portion(text)
+            if datetime_portion != text:
+                logger.info(f"Extracted datetime portion: '{datetime_portion}' from '{text}'")
+                parsed = dateparser.parse(datetime_portion, settings=settings)
 
         if parsed:
             # Handle ambiguous time-of-day keywords
-            text_lower = text.lower()
             if 'afternoon' in text_lower and parsed.hour < 12:
                 parsed = parsed.replace(hour=14)
             elif 'morning' in text_lower and parsed.hour > 12:
@@ -65,16 +116,30 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
                 parsed = parsed.replace(hour=18)
 
             ambiguous = any(w in text_lower for w in ['afternoon', 'morning', 'evening'])
-            return {"datetime": parsed, "confidence": 0.9 if not ambiguous else 0.7, "ambiguous": ambiguous}
+            logger.info(f"Parsed datetime: {parsed.isoformat()} (timezone: {timezone})")
+            return {
+                "datetime": parsed,
+                "confidence": 0.9 if not ambiguous else 0.7,
+                "ambiguous": ambiguous,
+                "timezone": timezone,
+            }
 
-        return {"datetime": None, "confidence": 0, "ambiguous": True}
+        return {"datetime": None, "confidence": 0, "ambiguous": True, "timezone": timezone}
     else:
-        # Fallback to original parser
+        # Fallback to original parser - also try extracting datetime portion
         try:
-            parsed = parse_natural_datetime(text)
-            return {"datetime": parsed, "confidence": 0.8, "ambiguous": False}
+            parsed = parse_natural_datetime(text, timezone)
+            return {"datetime": parsed, "confidence": 0.8, "ambiguous": False, "timezone": timezone}
         except Exception:
-            return {"datetime": None, "confidence": 0, "ambiguous": True}
+            # Try with extracted datetime portion
+            try:
+                datetime_portion = _extract_datetime_portion(text)
+                if datetime_portion != text:
+                    parsed = parse_natural_datetime(datetime_portion, timezone)
+                    return {"datetime": parsed, "confidence": 0.7, "ambiguous": False, "timezone": timezone}
+            except Exception:
+                pass
+            return {"datetime": None, "confidence": 0, "ambiguous": True, "timezone": timezone}
 
 
 def extract_duration(text: str) -> int:
@@ -124,6 +189,44 @@ def extract_meeting_title(text: str) -> str:
     if title_match:
         return title_match.group(1).strip().title()
 
+    # Medical tests / Lab work (common abbreviations)
+    # IMPORTANT: Longer/more specific patterns first to avoid partial matches
+    medical_tests = [
+        ('complete blood count', 'CBC - Complete Blood Count'),
+        ('chest x-ray', 'Chest X-Ray'),
+        ('chest xray', 'Chest X-Ray'),
+        ('chest x ray', 'Chest X-Ray'),
+        ('blood test', 'Blood Test'),
+        ('blood work', 'Blood Work'),
+        ('lipid panel', 'Lipid Panel'),
+        ('cholesterol', 'Cholesterol Test'),
+        ('glucose', 'Glucose Test'),
+        ('hba1c', 'HbA1c Test'),
+        ('a1c', 'HbA1c Test'),
+        ('thyroid', 'Thyroid Panel'),
+        ('tsh', 'TSH Test'),
+        ('urinalysis', 'Urinalysis'),
+        ('urine test', 'Urine Test'),
+        ('x-ray', 'X-Ray'),
+        ('xray', 'X-Ray'),
+        ('mri', 'MRI Scan'),
+        ('ct scan', 'CT Scan'),
+        ('ultrasound', 'Ultrasound'),
+        ('ecg', 'ECG/EKG'),
+        ('ekg', 'ECG/EKG'),
+        ('check-up', 'Health Checkup'),
+        ('checkup', 'Health Checkup'),
+        ('physical', 'Physical Examination'),
+        ('consultation', 'Consultation'),
+        ('follow-up', 'Follow-up Appointment'),
+        ('followup', 'Follow-up Appointment'),
+        ('cbc', 'CBC - Complete Blood Count'),
+    ]
+
+    for keyword, title in medical_tests:
+        if keyword in text_lower:
+            return title
+
     # Infer from meeting type keywords
     if 'sync' in text_lower:
         return 'Sync Meeting'
@@ -139,6 +242,8 @@ def extract_meeting_title(text: str) -> str:
         return 'Review Meeting'
     if 'planning' in text_lower:
         return 'Planning Session'
+    if 'appointment' in text_lower:
+        return 'Appointment'
 
     return 'Meeting'
 
@@ -157,11 +262,39 @@ def format_confirmation_request(dt: datetime, duration: int, title: str, attende
 
 def format_meeting_success(result: dict) -> str:
     """Format a successful meeting confirmation message."""
-    return (
-        f"**Meeting scheduled!**\n\n"
-        f"- **{result.get('title', 'Meeting')}**\n"
-        f"- {result.get('message', '')}\n"
-    )
+    title = result.get('title', 'Meeting')
+    start_time = result.get('start_time', '')
+    duration = result.get('duration_minutes', 60)
+    participants = result.get('participants', [])
+
+    # Parse the start_time if it's a string
+    if start_time:
+        try:
+            if isinstance(start_time, str):
+                dt = date_parser.parse(start_time)
+            else:
+                dt = start_time
+            formatted_date = dt.strftime('%A, %B %d, %Y')
+            formatted_time = dt.strftime('%I:%M %p')
+        except Exception:
+            formatted_date = start_time
+            formatted_time = ""
+    else:
+        formatted_date = "Unknown date"
+        formatted_time = ""
+
+    msg = f"**Appointment Confirmed!**\n\n"
+    msg += f"**{title}**\n\n"
+    msg += f"- **Date:** {formatted_date}\n"
+    if formatted_time:
+        msg += f"- **Time:** {formatted_time}\n"
+    msg += f"- **Duration:** {duration} minutes\n"
+    if participants:
+        msg += f"- **Attendees:** {', '.join(participants)}\n"
+
+    msg += "\nYou'll receive a reminder before your appointment."
+
+    return msg
 
 
 class CalendarCheckInput(BaseModel):
@@ -243,19 +376,39 @@ class FindSlotsInput(BaseModel):
     user_id: Optional[str] = Field(default=None, description="User ID")
 
 
-def parse_natural_datetime(datetime_str: str) -> datetime:
+def parse_natural_datetime(datetime_str: str, timezone: str = "UTC") -> datetime:
     """
-    Parse natural language datetime into datetime object.
-    
+    Parse natural language datetime or ISO format string into datetime object.
+
     Supports formats like:
     - "tomorrow at 3pm"
     - "next Tuesday at 10:00 AM"
     - "2024-01-15 14:30"
+    - "2024-01-15T14:30:00+05:00" (ISO format)
     - "in 2 hours"
+
+    Args:
+        datetime_str: Natural language or ISO format datetime string
+        timezone: User's timezone (used for relative dates)
+
+    Returns:
+        datetime object
     """
+    datetime_str = datetime_str.strip()
+
+    # First, check if this is an ISO format string (from stored pending_schedule)
+    # ISO format: 2024-01-15T14:30:00 or 2024-01-15T14:30:00+05:00
+    if 'T' in datetime_str and len(datetime_str) >= 19:
+        try:
+            parsed = date_parser.parse(datetime_str)
+            logger.info(f"Parsed ISO datetime: {parsed.isoformat()}")
+            return parsed
+        except Exception as e:
+            logger.warning(f"Failed to parse as ISO: {e}")
+
     now = datetime.now()
     datetime_lower = datetime_str.lower().strip()
-    
+
     # Handle relative dates
     if "tomorrow" in datetime_lower:
         base_date = now + timedelta(days=1)
@@ -288,31 +441,44 @@ def parse_natural_datetime(datetime_str: str) -> datetime:
         if days_ahead <= 0:
             days_ahead += 7
         base_date = now + timedelta(days=days_ahead)
+    elif "next saturday" in datetime_lower:
+        days_ahead = 5 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        base_date = now + timedelta(days=days_ahead)
+    elif "next sunday" in datetime_lower:
+        days_ahead = 6 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        base_date = now + timedelta(days=days_ahead)
     else:
         # Try to parse with dateutil
         try:
-            return date_parser.parse(datetime_str, fuzzy=True)
+            parsed = date_parser.parse(datetime_str, fuzzy=True)
+            logger.info(f"Parsed with dateutil: {parsed.isoformat()}")
+            return parsed
         except Exception:
             base_date = now
-    
+
     # Extract time
     time_match = re.search(r'(\d{1,2}):?(\d{2})?\s*(am|pm)?', datetime_lower, re.IGNORECASE)
     if time_match:
         hour = int(time_match.group(1))
         minute = int(time_match.group(2)) if time_match.group(2) else 0
         ampm = time_match.group(3)
-        
+
         if ampm:
             if ampm.lower() == 'pm' and hour != 12:
                 hour += 12
             elif ampm.lower() == 'am' and hour == 12:
                 hour = 0
-        
+
         base_date = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
     else:
         # Default to 9 AM if no time specified
         base_date = base_date.replace(hour=9, minute=0, second=0, microsecond=0)
-    
+
+    logger.info(f"Parsed natural datetime '{datetime_str}' -> {base_date.isoformat()}")
     return base_date
 
 
@@ -477,27 +643,33 @@ async def schedule_meeting(
             }
             
             result = supabase_client.table("calendar_events").insert(meeting_data).execute()
-            
+
             if not result.data:
-                raise Exception("Failed to insert meeting")
-                
+                raise Exception("Insert returned no data")
+
+            # Success - meeting saved to database
+            return {
+                "success": True,
+                "meeting_id": meeting_id,
+                "title": title,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "duration_minutes": duration_minutes,
+                "participants": participants or [],
+                "location": location,
+                "status": "confirmed",
+                "message": f"Meeting '{title}' scheduled for {start_time.strftime('%A, %B %d at %I:%M %p')}",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
         except Exception as db_error:
-            logger.warning(f"Database operation failed: {db_error}")
-            # Continue with mock success for demo purposes
-        
-        return {
-            "success": True,
-            "meeting_id": meeting_id,
-            "title": title,
-            "start_time": start_time.isoformat(),
-            "end_time": end_time.isoformat(),
-            "duration_minutes": duration_minutes,
-            "participants": participants or [],
-            "location": location,
-            "status": "confirmed",
-            "message": f"Meeting '{title}' scheduled for {start_time.strftime('%A, %B %d at %I:%M %p')}",
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+            logger.error(f"Failed to save meeting to database: {db_error}")
+            return {
+                "success": False,
+                "error": "Could not save to calendar - database error",
+                "message": "Sorry, I couldn't save the appointment. Please try again later or contact support.",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
         
     except Exception as e:
         logger.error(f"Meeting scheduling error: {e}")
@@ -607,25 +779,34 @@ async def reschedule_meeting(
             new_end = new_start + timedelta(minutes=duration)
             
             # Update meeting
-            supabase_client.table("calendar_events").update({
+            update_result = supabase_client.table("calendar_events").update({
                 "start_time": new_start.isoformat(),
                 "end_time": new_end.isoformat(),
             }).eq("id", meeting_id).execute()
-            
+
+            if not update_result.data:
+                raise Exception("Update returned no data")
+
+            # Success - meeting rescheduled in database
+            return {
+                "success": True,
+                "meeting_id": meeting_id,
+                "new_start_time": new_start.isoformat(),
+                "new_end_time": new_end.isoformat(),
+                "notifications_sent": notify_participants,
+                "message": f"Meeting rescheduled to {new_start.strftime('%A, %B %d at %I:%M %p')}",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
         except Exception as db_error:
-            logger.warning(f"Database operation failed: {db_error}")
-            duration = 60
-            new_end = new_start + timedelta(minutes=duration)
-        
-        return {
-            "success": True,
-            "meeting_id": meeting_id,
-            "new_start_time": new_start.isoformat(),
-            "new_end_time": new_end.isoformat(),
-            "notifications_sent": notify_participants,
-            "message": f"Meeting rescheduled to {new_start.strftime('%A, %B %d at %I:%M %p')}",
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+            logger.error(f"Failed to reschedule meeting in database: {db_error}")
+            return {
+                "success": False,
+                "error": "Could not reschedule meeting - database error",
+                "message": "Sorry, I couldn't reschedule the appointment. Please try again later.",
+                "meeting_id": meeting_id,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
         
     except Exception as e:
         logger.error(f"Rescheduling error: {e}")
