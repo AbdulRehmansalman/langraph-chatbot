@@ -443,10 +443,11 @@ async def websocket_chat_endpoint(
             # Send status updates
             await adapter.on_node_start("router", "Analyzing query...")
 
-            # Create RAG chain
+            # Create RAG chain with thread_id for state persistence
             rag_chain = create_rag_chain(
                 user_id=user_id,
-                document_ids=validated_doc_ids
+                document_ids=validated_doc_ids,
+                thread_id=thread_id,  # Critical for conversation continuity
             )
 
             await adapter.on_node_start("retrieval", "Searching documents...")

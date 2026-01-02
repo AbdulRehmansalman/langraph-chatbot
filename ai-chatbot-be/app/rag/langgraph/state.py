@@ -321,37 +321,6 @@ def track_node(state: AgentState, node_name: str) -> dict[str, Any]:
     }
 
 
-def add_tool_result(
-    state: AgentState,
-    tool_name: str,
-    tool_input: dict,
-    tool_output: Any,
-    status: str = "success",
-    error: Optional[str] = None,
-    duration_ms: float = 0.0,
-) -> dict[str, Any]:
-    """Add a tool execution result."""
-    tool_call = ToolCall(
-        tool_name=tool_name,
-        tool_input=tool_input,
-        tool_output=tool_output,
-        status=ToolStatus(status),
-        error=error,
-        duration_ms=duration_ms,
-    ).model_dump()
-
-    tools_called = list(state.get("tools_called", []))
-    tools_called.append(tool_name)
-
-    tool_results = list(state.get("tool_results", []))
-    tool_results.append(tool_call)
-
-    return {
-        "tools_called": tools_called,
-        "tool_results": tool_results,
-    }
-
-
 def add_error(
     state: AgentState,
     node: str,
@@ -400,17 +369,6 @@ def add_documents(
     return {
         "documents": all_docs,
         "context": context,
-    }
-
-
-def set_calendar_meeting(
-    state: AgentState,
-    meeting: dict[str, Any],
-) -> dict[str, Any]:
-    """Set a scheduled meeting in state."""
-    return {
-        "scheduled_meeting": meeting,
-        "calendar_action": "schedule",
     }
 
 
@@ -470,39 +428,6 @@ def get_response_context(state: AgentState) -> str:
 
 
 # =============================================================================
-# ROUTING HELPERS
-# =============================================================================
-
-def should_route_to_documents(state: AgentState) -> bool:
-    """Check if query should go to document search."""
-    classification = state.get("query_classification", "")
-    return classification == "document"
-
-
-def should_route_to_calendar(state: AgentState) -> bool:
-    """Check if query should go to calendar agent."""
-    classification = state.get("query_classification", "")
-    return classification == "calendar"
-
-
-def should_require_approval(state: AgentState) -> bool:
-    """Check if action requires human approval."""
-    # Calendar deletions and modifications require approval
-    action = state.get("calendar_action")
-    if action in ["cancel", "reschedule"]:
-        return True
-
-    # Check if explicitly marked
-    return state.get("requires_approval", False)
-
-
-def is_greeting(state: AgentState) -> bool:
-    """Check if query is a greeting."""
-    classification = state.get("query_classification", "")
-    return classification == "greeting"
-
-
-# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -527,16 +452,9 @@ __all__ = [
     "create_initial_state",
     # Helpers
     "track_node",
-    "add_tool_result",
     "add_error",
     "add_documents",
-    "set_calendar_meeting",
     "check_iteration_limit",
     "update_metrics",
     "get_response_context",
-    # Routing
-    "should_route_to_documents",
-    "should_route_to_calendar",
-    "should_require_approval",
-    "is_greeting",
 ]

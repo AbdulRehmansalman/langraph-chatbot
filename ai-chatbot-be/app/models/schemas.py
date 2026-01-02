@@ -115,13 +115,18 @@ class ChatMessage(BaseModel):
         max_length=MAX_DOCUMENT_IDS,
         description="Optional document IDs for RAG (max 50)"
     )
-    
+    thread_id: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Thread ID for conversation continuity (required for multi-turn scheduling)"
+    )
+
     @field_validator('message')
     @classmethod
     def validate_message(cls, v: str) -> str:
         """
         Validate message content.
-        
+
         Note: Detailed validation (prompt injection, token count)
         is performed in the validation module to keep schemas clean.
         This validator handles basic checks.

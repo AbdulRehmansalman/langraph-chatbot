@@ -5,7 +5,6 @@ LangGraph Tools Package
 Production tools for DocScheduler AI including:
 - Document analysis tools
 - Appointment scheduling tools
-- Communication tools
 - Human escalation tools
 """
 
@@ -24,11 +23,6 @@ from app.rag.langgraph.tools.appointment_tools import (
     send_invites,
     set_reminder,
     find_available_slots,
-)
-
-from app.rag.langgraph.tools.communication_tools import (
-    send_notification,
-    create_task,
 )
 
 from app.rag.langgraph.tools.escalation_tools import (
@@ -51,9 +45,6 @@ __all__ = [
     "send_invites",
     "set_reminder",
     "find_available_slots",
-    # Communication tools
-    "send_notification",
-    "create_task",
     # Escalation tools
     "request_approval",
     "flag_for_review",
