@@ -144,6 +144,7 @@ class AgentState(TypedDict, total=False):
     thread_id: str
     user_id: Optional[str]
     user_name: str
+    user_timezone: str  # User's timezone (e.g., "Asia/Karachi", "America/New_York")
     session_id: Optional[str]
     timestamp: str
 
@@ -216,6 +217,7 @@ def create_initial_state(
     query: str,
     user_id: Optional[str] = None,
     user_name: Optional[str] = None,
+    user_timezone: str = "UTC",
     session_id: Optional[str] = None,
     document_ids: Optional[list[str]] = None,
     thread_id: Optional[str] = None,
@@ -228,6 +230,7 @@ def create_initial_state(
         query: User's query
         user_id: User identifier
         user_name: User's display name
+        user_timezone: User's timezone (e.g., "Asia/Karachi", "America/New_York")
         session_id: Session identifier
         document_ids: Document IDs to search within
         thread_id: Thread ID for conversation continuity
@@ -250,6 +253,7 @@ def create_initial_state(
         thread_id=thread_id or str(uuid4()),
         user_id=user_id,
         user_name=user_name or "User",
+        user_timezone=user_timezone,
         session_id=session_id,
         timestamp=datetime.utcnow().isoformat(),
 

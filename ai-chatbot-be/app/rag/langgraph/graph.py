@@ -1030,7 +1030,7 @@ async def calendar_node(state: AgentState) -> dict:
 
     query = state.get("original_query", "")
     user_id = state.get("user_id")
-    timezone = state.get("timezone", "UTC")
+    user_timezone = state.get("user_timezone", "UTC")
     user_name = state.get("user_name", "User")
 
     updates = track_node(state, "calendar")
@@ -1063,7 +1063,7 @@ async def calendar_node(state: AgentState) -> dict:
                 return updates
 
             # Parse datetime from user query
-            parsed = parse_natural_datetime_enhanced(query, timezone)
+            parsed = parse_natural_datetime_enhanced(query, user_timezone)
 
             if not parsed["datetime"]:
                 updates["response"] = (
@@ -1128,7 +1128,7 @@ async def calendar_node(state: AgentState) -> dict:
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"""User: {user_name}
 User ID: {user_id}
-Timezone: {timezone}
+Timezone: {user_timezone}
 
 User request: {query}
 
@@ -1375,6 +1375,7 @@ class Agent:
         query: str,
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        user_timezone: Optional[str] = None,
         document_ids: Optional[list[str]] = None,
         thread_id: Optional[str] = None,
         use_cache: bool = True,
@@ -1432,6 +1433,7 @@ class Agent:
             "original_query": query,
             "user_id": user_id,
             "user_name": user_name or "User",
+            "user_timezone": user_timezone or "UTC",
             "document_ids": document_ids,
             "thread_id": effective_thread_id,
         }

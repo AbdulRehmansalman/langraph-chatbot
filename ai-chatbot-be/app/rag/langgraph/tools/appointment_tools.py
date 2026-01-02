@@ -20,12 +20,68 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 try:
+    import pytz
+    PYTZ_AVAILABLE = True
+except ImportError:
+    PYTZ_AVAILABLE = False
+
+try:
     import dateparser
     DATEPARSER_AVAILABLE = True
 except ImportError:
     DATEPARSER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _get_timezone(tz_str: str) -> Any:
+    """Get a timezone object from timezone string."""
+    if PYTZ_AVAILABLE:
+        try:
+            return pytz.timezone(tz_str)
+        except Exception:
+            return pytz.UTC
+    return None
+
+
+def _localize_datetime(dt: datetime, tz_str: str) -> datetime:
+    """
+    Localize a naive datetime to the specified timezone.
+
+    Args:
+        dt: Naive datetime object
+        tz_str: Timezone string (e.g., "Asia/Karachi", "America/New_York")
+
+    Returns:
+        Timezone-aware datetime in the specified timezone
+    """
+    if PYTZ_AVAILABLE:
+        try:
+            tz = pytz.timezone(tz_str)
+            # If datetime is naive, localize it (don't convert, just set the timezone)
+            if dt.tzinfo is None:
+                return tz.localize(dt)
+            else:
+                # If already has timezone, convert to the target timezone
+                return dt.astimezone(tz)
+        except Exception as e:
+            logger.warning(f"Failed to localize datetime to {tz_str}: {e}")
+            return dt
+    else:
+        # Without pytz, return as-is but log warning
+        logger.warning("pytz not available - timezone localization disabled")
+        return dt
+
+
+def _get_current_time_in_timezone(tz_str: str) -> datetime:
+    """Get current time in the specified timezone."""
+    if PYTZ_AVAILABLE:
+        try:
+            tz = pytz.timezone(tz_str)
+            return datetime.now(tz)
+        except Exception:
+            pass
+    return datetime.now()
 
 
 # =============================================================================
@@ -84,7 +140,7 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
     - "Schedule CBC tomorrow at 3pm" (extracts datetime portion)
 
     Returns:
-        dict with keys: datetime, confidence, ambiguous, timezone
+        dict with keys: datetime (timezone-aware), confidence, ambiguous, timezone
     """
     text_lower = text.lower()
     now = datetime.now()
@@ -370,6 +426,7 @@ class ScheduleMeetingInput(BaseModel):
     description: Optional[str] = Field(default=None, description="Meeting description")
     location: Optional[str] = Field(default=None, description="Meeting location or video link")
     user_id: Optional[str] = Field(default=None, description="User ID")
+    timezone: Optional[str] = Field(default="UTC", description="User's timezone (e.g., 'Asia/Karachi')")
 
 
 class RescheduleMeetingInput(BaseModel):
@@ -645,6 +702,7 @@ async def schedule_meeting(
     description: Optional[str] = None,
     location: Optional[str] = None,
     user_id: Optional[str] = None,
+    timezone: Optional[str] = "UTC",
 ) -> dict[str, Any]:
     """
     Schedule a new meeting on Google Calendar.
@@ -666,8 +724,12 @@ async def schedule_meeting(
     logger.info(f"SCHEDULE_MEETING: Creating '{title}' at {datetime_str} for user {user_id}")
 
     try:
-        # Parse the datetime
-        start_time = parse_natural_datetime(datetime_str)
+        # Parse the datetime with timezone awareness
+        parsed = parse_natural_datetime_enhanced(datetime_str, tz)
+        if not parsed.get("datetime"):
+            start_time = parse_natural_datetime(datetime_str, tz)
+        else:
+            start_time = parsed["datetime"]
         end_time = start_time + timedelta(minutes=duration_minutes)
 
         logger.info(f"SCHEDULE_MEETING: Parsed time - start={start_time}, end={end_time}")
@@ -746,8 +808,8 @@ async def schedule_meeting(
                 "id": meeting_id,
                 "user_id": user_id or "anonymous",
                 "title": title,
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
+                "description": description or f"Scheduled via DocScheduler AI",
+                "scheduled_time": start_time.isoformat(),
                 "duration_minutes": duration_minutes,
                 "participants": participants or [],
                 "description": description or f"Scheduled via DocScheduler AI",

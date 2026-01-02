@@ -179,18 +179,35 @@ class CalendarEvent:
     calendar_link: Optional[str] = None
     status: str = "confirmed"
     reminders: Optional[dict] = None
+    timezone: Optional[str] = None  # User's timezone (e.g., "Asia/Karachi")
 
     def to_google_event(self) -> dict:
         """Convert to Google Calendar API event format."""
+        # Determine the timezone to use:
+        # 1. Use explicitly set timezone
+        # 2. Or extract from datetime's tzinfo
+        # 3. Or default to UTC
+        tz_name = self.timezone
+        if not tz_name and self.start_time and self.start_time.tzinfo:
+            # Try to get timezone name from tzinfo
+            try:
+                tz_name = str(self.start_time.tzinfo)
+            except Exception:
+                tz_name = "UTC"
+        if not tz_name:
+            tz_name = "UTC"
+
+        logger.info(f"Creating Google event with timezone: {tz_name}")
+
         event = {
             "summary": self.title,
             "start": {
                 "dateTime": self.start_time.isoformat() if self.start_time else None,
-                "timeZone": "UTC",
+                "timeZone": tz_name,
             },
             "end": {
                 "dateTime": self.end_time.isoformat() if self.end_time else None,
-                "timeZone": "UTC",
+                "timeZone": tz_name,
             },
         }
 
