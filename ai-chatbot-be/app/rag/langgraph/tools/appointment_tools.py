@@ -143,14 +143,11 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
         dict with keys: datetime (timezone-aware), confidence, ambiguous, timezone
     """
     text_lower = text.lower()
-    # Get current time in user's timezone for relative date calculations
-    now = _get_current_time_in_timezone(timezone)
-
-    logger.info(f"Parsing datetime from '{text}' in timezone {timezone}, now={now.isoformat()}")
+    now = datetime.now()
 
     # First try our custom parser for common patterns (more reliable)
-    # This ensures "tomorrow" always means the next day in user's timezone
-    custom_parsed = _parse_common_datetime_patterns(text_lower, now, timezone)
+    # This ensures "tomorrow" always means the next day
+    custom_parsed = _parse_common_datetime_patterns(text_lower, now)
     if custom_parsed:
         logger.info(f"Custom parser result: {custom_parsed.isoformat()} for '{text}'")
         ambiguous = any(w in text_lower for w in ['afternoon', 'morning', 'evening'])
@@ -166,7 +163,7 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
             'TIMEZONE': timezone,
             'RETURN_AS_TIMEZONE_AWARE': True,
             'PREFER_DATES_FROM': 'future',
-            'RELATIVE_BASE': now.replace(tzinfo=None) if now.tzinfo else now,  # dateparser expects naive datetime
+            'RELATIVE_BASE': now,
         }
 
         # First try the full text
@@ -215,22 +212,14 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
             return {"datetime": None, "confidence": 0, "ambiguous": True, "timezone": timezone}
 
 
-def _parse_common_datetime_patterns(text: str, now: datetime, timezone: str = "UTC") -> datetime | None:
+def _parse_common_datetime_patterns(text: str, now: datetime) -> datetime | None:
     """
     Parse common datetime patterns with high reliability.
 
     Handles:
-    - "tomorrow at 4pm" -> next day at 16:00 in user's timezone
-    - "today at 3pm" -> same day at 15:00 in user's timezone
-    - "next monday at 10am" -> next Monday at 10:00 in user's timezone
-
-    Args:
-        text: The text to parse
-        now: Current time (should be timezone-aware in user's timezone)
-        timezone: User's timezone string (e.g., "Asia/Karachi")
-
-    Returns:
-        Timezone-aware datetime in user's timezone, or None if parsing fails
+    - "tomorrow at 4pm" -> next day at 16:00
+    - "today at 3pm" -> same day at 15:00
+    - "next monday at 10am" -> next Monday at 10:00
     """
     text_lower = text.lower()
 
@@ -251,19 +240,17 @@ def _parse_common_datetime_patterns(text: str, now: datetime, timezone: str = "U
             elif ampm == 'am' and hour == 12:
                 hour = 0
 
-    # Determine the date (using naive datetime for date calculation)
-    # We'll localize at the end
-    now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+    # Determine the date
     target_date = None
 
     if 'tomorrow' in text_lower:
-        target_date = now_naive + timedelta(days=1)
+        target_date = now + timedelta(days=1)
     elif 'today' in text_lower or 'tonight' in text_lower:
-        target_date = now_naive
+        target_date = now
         if 'tonight' in text_lower and hour < 17:
             hour = 19  # Default evening time
     elif 'next week' in text_lower:
-        target_date = now_naive + timedelta(weeks=1)
+        target_date = now + timedelta(weeks=1)
     else:
         # Check for day of week
         days_of_week = {
@@ -272,23 +259,18 @@ def _parse_common_datetime_patterns(text: str, now: datetime, timezone: str = "U
         }
         for day_name, day_num in days_of_week.items():
             if day_name in text_lower:
-                current_day = now_naive.weekday()
+                current_day = now.weekday()
                 days_ahead = day_num - current_day
 
                 # "next monday" always means the next occurrence
                 if 'next' in text_lower or days_ahead <= 0:
                     days_ahead += 7
 
-                target_date = now_naive + timedelta(days=days_ahead)
+                target_date = now + timedelta(days=days_ahead)
                 break
 
     if target_date:
-        # Create the datetime with the specified time
-        result = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        # Localize to user's timezone
-        localized = _localize_datetime(result, timezone)
-        logger.info(f"Parsed '{text}' -> {localized.isoformat()} (timezone: {timezone})")
-        return localized
+        return target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     return None
 
@@ -332,71 +314,40 @@ def extract_attendees(text: str) -> list[str]:
 
 
 def extract_meeting_title(text: str) -> str:
-    """Extract or generate a meeting title from the query."""
-    text_lower = text.lower()
-
-    # Look for explicit title patterns
-    title_match = re.search(r'(?:titled?|called?|named?)\s+["\']?([^"\']+)["\']?', text_lower)
+    """
+    Extract appointment title from query.
+    Simple approach: remove scheduling keywords and time expressions, use remainder as title.
+    """
+    # Look for explicit title patterns first
+    title_match = re.search(r'(?:titled?|called?|named?)\s+["\']?([^"\']+)["\']?', text.lower())
     if title_match:
         return title_match.group(1).strip().title()
 
-    # Medical tests / Lab work (common abbreviations)
-    # IMPORTANT: Longer/more specific patterns first to avoid partial matches
-    medical_tests = [
-        ('complete blood count', 'CBC - Complete Blood Count'),
-        ('chest x-ray', 'Chest X-Ray'),
-        ('chest xray', 'Chest X-Ray'),
-        ('chest x ray', 'Chest X-Ray'),
-        ('blood test', 'Blood Test'),
-        ('blood work', 'Blood Work'),
-        ('lipid panel', 'Lipid Panel'),
-        ('cholesterol', 'Cholesterol Test'),
-        ('glucose', 'Glucose Test'),
-        ('hba1c', 'HbA1c Test'),
-        ('a1c', 'HbA1c Test'),
-        ('thyroid', 'Thyroid Panel'),
-        ('tsh', 'TSH Test'),
-        ('urinalysis', 'Urinalysis'),
-        ('urine test', 'Urine Test'),
-        ('x-ray', 'X-Ray'),
-        ('xray', 'X-Ray'),
-        ('mri', 'MRI Scan'),
-        ('ct scan', 'CT Scan'),
-        ('ultrasound', 'Ultrasound'),
-        ('ecg', 'ECG/EKG'),
-        ('ekg', 'ECG/EKG'),
-        ('check-up', 'Health Checkup'),
-        ('checkup', 'Health Checkup'),
-        ('physical', 'Physical Examination'),
-        ('consultation', 'Consultation'),
-        ('follow-up', 'Follow-up Appointment'),
-        ('followup', 'Follow-up Appointment'),
-        ('cbc', 'CBC - Complete Blood Count'),
+    # Remove common scheduling phrases to extract the service/appointment name
+    scheduling_phrases = [
+        r'\b(schedule|book|set up|create|make|reserve)\s+(a|an|my|the)?\s*',
+        r'\b(appointment|meeting|session)\s+(for|at|on)?\s*',
+        r'\b(i\s+want|i\s+need|i\'d\s+like|can\s+you|please)\s+(to\s+)?',
+        r'\b(tomorrow|today|tonight)\s+(at\s+)?',
+        r'\b(next\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(at\s+)?',
+        r'\b(at|around|by)\s+\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b',
+        r'\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b',
+        r'\b(morning|afternoon|evening)\b',
+        r'\b(for\s+)?\d+\s+(hour|minute|min)s?\b',
     ]
 
-    for keyword, title in medical_tests:
-        if keyword in text_lower:
-            return title
+    cleaned = text.strip()
+    for pattern in scheduling_phrases:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
 
-    # Infer from meeting type keywords
-    if 'sync' in text_lower:
-        return 'Sync Meeting'
-    if 'standup' in text_lower or 'stand-up' in text_lower:
-        return 'Standup'
-    if '1:1' in text_lower or 'one on one' in text_lower or '1-on-1' in text_lower:
-        return '1:1 Meeting'
-    if 'interview' in text_lower:
-        return 'Interview'
-    if 'demo' in text_lower:
-        return 'Demo'
-    if 'review' in text_lower:
-        return 'Review Meeting'
-    if 'planning' in text_lower:
-        return 'Planning Session'
-    if 'appointment' in text_lower:
-        return 'Appointment'
+    # Clean up whitespace
+    cleaned = ' '.join(cleaned.split()).strip()
 
-    return 'Meeting'
+    # If we have something left, use it as title
+    if cleaned and len(cleaned) > 2:
+        return cleaned.title()
+
+    return 'Appointment'
 
 
 def format_confirmation_request(dt: datetime, duration: int, title: str, attendees: list) -> str:
@@ -664,36 +615,55 @@ async def check_calendar(
         
         date_str = target_date.strftime("%Y-%m-%d")
         
-        # Try to get events from database/calendar service
+        # Try Google Calendar first
+        events = []
         try:
-            from app.services.supabase_client import supabase_client
-            
-            result = supabase_client.table("calendar_events").select("*").eq(
-                "user_id", user_id
-            ).gte(
-                "start_time", f"{date_str}T00:00:00"
-            ).lte(
-                "start_time", f"{date_str}T23:59:59"
-            ).execute()
-            
-            events = result.data if result.data else []
-            
-        except Exception:
-            # Mock response if calendar table doesn't exist
-            events = []
-        
+            from app.services.calendar import get_calendar_service
+
+            calendar_service = await get_calendar_service(user_id)
+            end_date = target_date + timedelta(days=1)
+
+            gcal_result = await calendar_service.list_events(
+                start_date=target_date,
+                end_date=end_date,
+                max_results=50
+            )
+
+            if gcal_result.get("success"):
+                events = gcal_result.get("events", [])
+                logger.info(f"CHECK_CALENDAR: Found {len(events)} events from Google Calendar")
+
+        except Exception as gcal_error:
+            logger.warning(f"CHECK_CALENDAR: Google Calendar not available: {gcal_error}")
+            # Fallback to Supabase
+            try:
+                from app.services.supabase_client import supabase_client
+
+                result = supabase_client.table("calendar_events").select("*").eq(
+                    "user_id", user_id
+                ).gte(
+                    "start_time", f"{date_str}T00:00:00"
+                ).lte(
+                    "start_time", f"{date_str}T23:59:59"
+                ).execute()
+
+                events = result.data if result.data else []
+
+            except Exception:
+                events = []
+
         # Format events
         formatted_events = []
         for event in events:
             formatted_events.append({
-                "id": event.get("id"),
-                "title": event.get("title"),
+                "id": event.get("id") or event.get("event_id"),
+                "title": event.get("title") or event.get("summary"),
                 "start_time": event.get("start_time"),
                 "end_time": event.get("end_time"),
                 "location": event.get("location"),
-                "participants": event.get("participants", []),
+                "participants": event.get("participants") or event.get("attendees", []),
             })
-        
+
         # Calculate free slots (simple implementation)
         free_slots = []
         if not events:
@@ -701,7 +671,7 @@ async def check_calendar(
                 {"start": f"{date_str}T09:00:00", "end": f"{date_str}T12:00:00"},
                 {"start": f"{date_str}T13:00:00", "end": f"{date_str}T17:00:00"},
             ]
-        
+
         return {
             "success": True,
             "date": date_str,
@@ -709,8 +679,9 @@ async def check_calendar(
             "events": formatted_events,
             "event_count": len(formatted_events),
             "free_slots": free_slots,
-            "has_availability": len(free_slots) > 0,
+            "has_availability": len(free_slots) > 0 or len(events) == 0,
             "timestamp": datetime.utcnow().isoformat(),
+            "source": "google_calendar" if events else "supabase",
         }
         
     except Exception as e:
@@ -734,10 +705,10 @@ async def schedule_meeting(
     timezone: Optional[str] = "UTC",
 ) -> dict[str, Any]:
     """
-    Schedule a new meeting.
-    
-    Handles natural language date/time parsing and conflict detection.
-    
+    Schedule a new meeting on Google Calendar.
+
+    Handles natural language date/time parsing and creates event on Google Calendar.
+
     Args:
         title: Meeting title
         datetime_str: Date and time string
@@ -746,13 +717,11 @@ async def schedule_meeting(
         description: Meeting description
         location: Meeting location
         user_id: User ID
-        timezone: User's timezone (e.g., 'Asia/Karachi')
 
     Returns:
-        Meeting creation result
+        Meeting creation result with Google Calendar link
     """
-    tz = timezone or "UTC"
-    logger.info(f"SCHEDULE_MEETING: Creating '{title}' at {datetime_str} for user {user_id} (timezone: {tz})")
+    logger.info(f"SCHEDULE_MEETING: Creating '{title}' at {datetime_str} for user {user_id}")
 
     try:
         # Parse the datetime with timezone awareness
@@ -763,7 +732,7 @@ async def schedule_meeting(
             start_time = parsed["datetime"]
         end_time = start_time + timedelta(minutes=duration_minutes)
 
-        logger.info(f"SCHEDULE_MEETING: Parsed time - start={start_time.isoformat()}, end={end_time.isoformat()}, tz={tz}")
+        logger.info(f"SCHEDULE_MEETING: Parsed time - start={start_time}, end={end_time}")
 
         # Try to create event on Google Calendar first
         google_success = False
@@ -777,7 +746,7 @@ async def schedule_meeting(
                 calendar_service = await get_calendar_service(user_id)
 
                 if calendar_service:
-                    # Create calendar event object with timezone
+                    # Create calendar event object
                     calendar_event = CalendarEvent(
                         title=title,
                         description=description or f"Scheduled via DocScheduler AI",
@@ -785,7 +754,6 @@ async def schedule_meeting(
                         end_time=end_time,
                         location=location,
                         attendees=participants,
-                        timezone=tz,
                     )
 
                     # Create event on Google Calendar
@@ -799,38 +767,10 @@ async def schedule_meeting(
 
                     if google_result.get("success"):
                         google_success = True
-                        google_event_id = google_result.get("event_id")
-
-                        # Also save to database for record keeping
-                        try:
-                            from app.services.supabase_client import supabase_client
-                            import uuid
-
-                            meeting_data = {
-                                "id": str(uuid.uuid4()),
-                                "user_id": user_id,
-                                "title": title,
-                                "description": description or f"Scheduled via DocScheduler AI",
-                                "scheduled_time": start_time.isoformat(),
-                                "duration_minutes": duration_minutes,
-                                "meeting_link": google_result.get("calendar_link"),
-                                "attendees": participants or [],
-                                "status": "confirmed",
-                                "google_event_id": google_event_id,
-                            }
-
-                            db_result = supabase_client.table("meetings").insert(meeting_data).execute()
-                            if db_result.data:
-                                logger.info(f"SCHEDULE_MEETING: ✅ Saved to meetings table: {db_result.data[0].get('id')}")
-                            else:
-                                logger.warning("SCHEDULE_MEETING: Failed to save to meetings table")
-                        except Exception as db_err:
-                            logger.warning(f"SCHEDULE_MEETING: DB save error (non-fatal): {db_err}")
-
                         # Successfully created on Google Calendar
                         return {
                             "success": True,
-                            "meeting_id": google_event_id,
+                            "meeting_id": google_result.get("event_id"),
                             "title": title,
                             "start_time": start_time.isoformat(),
                             "end_time": end_time.isoformat(),
@@ -847,7 +787,7 @@ async def schedule_meeting(
                     else:
                         logger.warning(f"SCHEDULE_MEETING: Google Calendar failed: {google_result.get('error')}")
                 else:
-                    logger.info("SCHEDULE_MEETING: Google Calendar not configured, using database")
+                    logger.info("SCHEDULE_MEETING: Google Calendar not configured, using Supabase")
 
             except Exception as gcal_error:
                 logger.warning(f"SCHEDULE_MEETING: Google Calendar error: {gcal_error}")
@@ -855,34 +795,34 @@ async def schedule_meeting(
         else:
             logger.warning("SCHEDULE_MEETING: No user_id provided, skipping Google Calendar")
 
-        # Fallback: Save to database if Google Calendar fails or unavailable
-        logger.info("SCHEDULE_MEETING: Saving to meetings table")
+        # Fallback: Save to Supabase if Google Calendar fails or unavailable
+        logger.info("SCHEDULE_MEETING: Saving to Supabase storage")
 
         import uuid
         meeting_id = str(uuid.uuid4())
-        
+
         try:
             from app.services.supabase_client import supabase_client
 
-            # Use correct field names matching the meetings table schema
             meeting_data = {
                 "id": meeting_id,
-                "user_id": user_id,
+                "user_id": user_id or "anonymous",
                 "title": title,
                 "description": description or f"Scheduled via DocScheduler AI",
                 "scheduled_time": start_time.isoformat(),
                 "duration_minutes": duration_minutes,
-                "meeting_link": location,  # Use location as meeting link if provided
-                "attendees": participants or [],
-                "status": "scheduled",
-                "google_event_id": None,  # No Google event since Calendar not available
+                "participants": participants or [],
+                "description": description or f"Scheduled via DocScheduler AI",
+                "location": location,
+                "status": "confirmed",
+                "created_at": datetime.utcnow().isoformat(),
             }
 
-            logger.info(f"SCHEDULE_MEETING: Inserting to meetings table: {meeting_data}")
-            result = supabase_client.table("meetings").insert(meeting_data).execute()
+            logger.info(f"SCHEDULE_MEETING: Inserting to Supabase: {meeting_data}")
+            result = supabase_client.table("calendar_events").insert(meeting_data).execute()
 
             if result.data:
-                logger.info(f"SCHEDULE_MEETING: ✅ Successfully saved to meetings: {result.data}")
+                logger.info(f"SCHEDULE_MEETING: ✅ Successfully saved to Supabase: {result.data}")
                 # Success - meeting saved to database
                 return {
                     "success": True,
@@ -893,45 +833,33 @@ async def schedule_meeting(
                     "duration_minutes": duration_minutes,
                     "participants": participants or [],
                     "location": location,
-                    "status": "scheduled",
+                    "status": "confirmed",
                     "message": f"✅ '{title}' scheduled for {start_time.strftime('%A, %B %d at %I:%M %p')}",
                     "timestamp": datetime.utcnow().isoformat(),
-                    "source": "database",
+                    "source": "supabase",
                     "note": "Saved to local calendar. Connect Google Calendar for sync.",
                 }
             else:
-                logger.warning(f"SCHEDULE_MEETING: Insert returned no data")
+                logger.warning(f"SCHEDULE_MEETING: Supabase insert returned no data")
                 raise Exception("Insert returned no data")
 
-            # Success - meeting saved to database
+        except Exception as db_error:
+            logger.error(f"SCHEDULE_MEETING: Database error: {db_error}", exc_info=True)
+
+            # Storage failed - return failure so user knows appointment was NOT saved
             return {
-                "success": True,
-                "meeting_id": meeting_id,
-                "title": title,
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "duration_minutes": duration_minutes,
-                "participants": participants or [],
-                "location": location,
-                "status": "confirmed",
-                "message": f"Meeting '{title}' scheduled for {start_time.strftime('%A, %B %d at %I:%M %p')}",
+                "success": False,
+                "error": "Could not save appointment to calendar",
+                "message": "❌ Sorry, I couldn't save your appointment. Please try again or check your calendar connection.",
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-        except Exception as db_error:
-            logger.error(f"Failed to save meeting to database: {db_error}")
-            return {
-                "success": False,
-                "error": "Could not save to calendar - database error",
-                "message": "Sorry, I couldn't save the appointment. Please try again later or contact support.",
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-        
     except Exception as e:
-        logger.error(f"Meeting scheduling error: {e}")
+        logger.error(f"SCHEDULE_MEETING: Error - {e}", exc_info=True)
         return {
             "success": False,
             "error": str(e),
+            "message": f"Error scheduling: {str(e)}",
             "timestamp": datetime.utcnow().isoformat(),
         }
 

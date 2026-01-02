@@ -57,10 +57,11 @@ async def send_message(
             f"Documents: {len(validated_doc_ids) if validated_doc_ids else 0}"
         )
 
-        # Create RAG chain (auto-uses settings)
+        # Create RAG chain with thread_id for conversation continuity
         rag_chain = create_rag_chain(
             user_id=user_id,
-            document_ids=validated_doc_ids
+            document_ids=validated_doc_ids,
+            thread_id=message.thread_id,  # Required for multi-turn scheduling
         )
 
         # Generate response

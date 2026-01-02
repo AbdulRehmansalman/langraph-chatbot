@@ -13,13 +13,15 @@ Production-ready agent graph with:
 Graph Structure:
     entry → router → [document | calendar | direct] → response → END
                    ↘ greeting → END
-                   ↘ scheduling_flow → END (after user confirms)
+                   ↘ execute_scheduling → END (user confirmed with "yes")
                    ↘ human_review → response → END
 
-Calendar Agent:
-    - Uses ReAct pattern with bound tools (check_calendar, schedule_meeting, etc.)
-    - Scheduling requests require user confirmation before actual booking
-    - Tools return real results from database - no mock successes
+Scheduling Flow:
+    1. User: "Schedule CBC test tomorrow at 3pm"
+    2. calendar_node: Parses request, stores pending_schedule in state, asks for confirmation
+    3. User: "yes"
+    4. router: Detects confirmation, routes to execute_scheduling
+    5. execute_scheduling: Calls schedule_meeting tool, confirms booking
 """
 
 import logging
@@ -46,32 +48,79 @@ from app.rag.langgraph.state import (
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# USER-BASED PENDING SCHEDULE CACHE
+# PENDING SCHEDULE CACHE (User + Thread based fallback)
 # =============================================================================
-# Fallback cache for pending_schedule when thread_id isn't passed
-# This ensures scheduling confirmation works even without proper thread_id
+# Used when state checkpointing isn't preserving pending_schedule across turns
+# Key format: "user_id:thread_id" or just "user_id" if no thread_id
 _pending_schedule_cache: dict[str, dict] = {}
 
 
-def _cache_pending_schedule(user_id: str, pending: dict) -> None:
-    """Cache pending schedule for a user."""
-    if user_id:
-        _pending_schedule_cache[user_id] = pending
-        logger.info(f"Cached pending schedule for user {user_id}")
+def _get_cache_key(user_id: str, thread_id: str = None) -> str:
+    """Generate cache key from user_id and optional thread_id."""
+    if thread_id:
+        return f"{user_id}:{thread_id}"
+    return user_id
 
 
-def _get_cached_pending_schedule(user_id: str) -> dict | None:
+def cache_pending_schedule(user_id: str, pending: dict, thread_id: str = None) -> None:
+    """Cache pending schedule for a user (fallback for state persistence)."""
+    if user_id and pending:
+        # Store with thread_id if available
+        cache_key = _get_cache_key(user_id, thread_id)
+        _pending_schedule_cache[cache_key] = pending
+
+        # Also store with just user_id as fallback (for cases where thread_id changes)
+        if thread_id:
+            _pending_schedule_cache[user_id] = pending
+
+        logger.info(f"CACHE: ✅ Stored pending schedule for key '{cache_key}': {pending.get('title')} at {pending.get('datetime')}")
+        logger.info(f"CACHE: Current cache keys = {list(_pending_schedule_cache.keys())}")
+    else:
+        logger.warning(f"CACHE: ⚠️ Cannot cache - user_id={user_id}, pending={pending is not None}")
+
+
+def get_cached_pending_schedule(user_id: str, thread_id: str = None) -> dict | None:
     """Get cached pending schedule for a user."""
-    if user_id and user_id in _pending_schedule_cache:
-        return _pending_schedule_cache[user_id]
-    return None
+    if not user_id:
+        logger.warning(f"CACHE: ⚠️ Cannot retrieve - user_id is None/empty")
+        return None
+
+    # Try with thread_id first
+    if thread_id:
+        cache_key = _get_cache_key(user_id, thread_id)
+        result = _pending_schedule_cache.get(cache_key)
+        if result:
+            logger.info(f"CACHE: ✅ Found cached schedule for key '{cache_key}': {result.get('title')}")
+            return result
+
+    # Fall back to user_id only
+    result = _pending_schedule_cache.get(user_id)
+    if result:
+        logger.info(f"CACHE: ✅ Found cached schedule for user '{user_id}': {result.get('title')}")
+    else:
+        logger.info(f"CACHE: ❌ No cached schedule for user '{user_id}' (cache keys: {list(_pending_schedule_cache.keys())})")
+    return result
 
 
-def _clear_cached_pending_schedule(user_id: str) -> None:
+def clear_cached_pending_schedule(user_id: str, thread_id: str = None) -> None:
     """Clear cached pending schedule for a user."""
-    if user_id and user_id in _pending_schedule_cache:
-        del _pending_schedule_cache[user_id]
-        logger.info(f"Cleared pending schedule cache for user {user_id}")
+    keys_to_remove = []
+
+    # Remove thread-specific key
+    if thread_id:
+        cache_key = _get_cache_key(user_id, thread_id)
+        if cache_key in _pending_schedule_cache:
+            keys_to_remove.append(cache_key)
+
+    # Also remove user-only key
+    if user_id in _pending_schedule_cache:
+        keys_to_remove.append(user_id)
+
+    for key in keys_to_remove:
+        del _pending_schedule_cache[key]
+        logger.info(f"Cleared pending schedule for key {key}")
+
+
 
 
 # Routing configuration
@@ -93,17 +142,197 @@ GREETING_PATTERNS = [
 
 # Calendar patterns - need calendar tools, not document retrieval
 CALENDAR_PATTERNS = [
-    r"\b(schedule|book|create|set\s+up)\s+(a\s+)?(meeting|appointment|call|session)",
-    r"\b(reschedule|cancel|postpone|move)\s+(my\s+|the\s+)?(meeting|appointment)",
+    # Direct scheduling commands
+    r"\b(schedule|book|create|set\s+up)\s+(a\s+)?(meeting|appointment|call|session|test|checkup|consultation)",
+    r"\b(i\s+want|i\s+need|i'd\s+like|can\s+you|please|could\s+you)\s+(to\s+)?(schedule|book|set\s+up)",
+    r"\b(schedule|book)\s+(me|my|a|an)\b",
+    r"\b(book|schedule)\s+(it|this|that)\b",
+    # Reschedule/cancel
+    r"\b(reschedule|cancel|postpone|move)\s+(my\s+|the\s+)?(meeting|appointment|test)",
+    # Check calendar
     r"\b(what|show|check|view)\s+(is\s+|are\s+)?(on\s+)?(my\s+)?(appointments?|meetings?|calendar|schedule)",
     r"\b(am\s+i\s+)?(free|available|busy)\s+(on|at|tomorrow|today|next)",
     r"\b(find|show|check)\s+(me\s+)?(a\s+)?(free\s+)?(slot|time|availability)",
     r"\bwhen\s+(can|am)\s+(i|we)\s+(meet|schedule|book)",
+    # Date/time patterns with scheduling intent
     r"\b(tomorrow|today|next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week))\s+at\s+\d",
     r"\bremind\s+(me|us)\s+(about|to|for)",
-    r"\bmy\s+calendar\b",  # Any mention of "my calendar"
-    r"\bmy\s+(meetings?|appointments?|schedule)\b",  # Any mention of personal schedule
+    r"\bmy\s+calendar\b",
+    r"\bmy\s+(meetings?|appointments?|schedule)\b",
 ]
+
+# Scheduling keywords that indicate intent to book an appointment
+SCHEDULING_KEYWORDS = [
+    "schedule", "book", "appointment", "reserve", "slot",
+]
+
+
+# =============================================================================
+# SERVICE RETRIEVAL VIA RAG
+# =============================================================================
+
+async def retrieve_service_from_documents(
+    query: str,
+    user_id: str = None,
+    top_k: int = 5
+) -> dict:
+    """
+    Retrieve and validate service/test from user's documents using RAG.
+
+    Args:
+        query: User's query containing service name
+        user_id: User ID for document access
+        top_k: Number of results to retrieve
+
+    Returns:
+        dict with:
+        - found: bool - whether relevant documents were found
+        - service_name: str - extracted service name from query
+        - context: str - relevant document context
+        - documents: list - retrieved documents
+        - similar_services: list - similar services if exact match not found
+    """
+    from app.rag.langgraph.nodes.retrieval import _vector_search
+
+    logger.info(f"SERVICE_RETRIEVAL: Searching for service in query '{query}' for user {user_id}")
+
+    # Extract the service name from query first
+    service_name = _extract_title_from_query(query)
+
+    if not user_id:
+        logger.info(f"SERVICE_RETRIEVAL: No user_id, using extracted name: {service_name}")
+        return {
+            "found": False,
+            "service_name": service_name,
+            "context": "",
+            "documents": [],
+            "similar_services": [],
+        }
+
+    try:
+        # Search for the service/query in documents
+        results = await _vector_search(
+            query=query,
+            user_id=user_id,
+            limit=top_k
+        )
+
+        if not results:
+            logger.info(f"SERVICE_RETRIEVAL: No documents found for '{query}'")
+            return {
+                "found": False,
+                "service_name": service_name,
+                "context": "",
+                "documents": [],
+                "similar_services": [],
+            }
+
+        # Check if service name appears in any result (exact/partial match)
+        service_lower = service_name.lower()
+        exact_match = False
+        similar_services = []
+
+        for doc in results:
+            content = doc.get("content", "").lower()
+            score = doc.get("score", 0)
+
+            # Check for exact match
+            if service_lower in content:
+                exact_match = True
+
+            # Extract potential service names from content for suggestions
+            # Look for capitalized phrases or common patterns
+            words = doc.get("content", "").split()
+            for i, word in enumerate(words):
+                # Find capitalized words that might be service names
+                if word and len(word) > 3 and word[0].isupper():
+                    # Check if it's part of a phrase (2-3 words)
+                    phrase = word
+                    # Safely check next word
+                    if i + 1 < len(words):
+                        next_word = words[i + 1]
+                        if next_word and len(next_word) > 0 and next_word[0].isupper():
+                            phrase = f"{word} {next_word}"
+                    if phrase.lower() != service_lower and phrase not in similar_services:
+                        similar_services.append(phrase)
+
+        # Limit to top 3 similar services
+        similar_services = similar_services[:3]
+
+        # Build context from results
+        context_parts = []
+        for doc in results[:3]:  # Limit context to top 3
+            content = doc.get("content", "")[:500]
+            source = doc.get("source", "Unknown")
+            context_parts.append(f"[{source}]: {content}")
+
+        context = "\n\n".join(context_parts)
+
+        logger.info(f"SERVICE_RETRIEVAL: Found {len(results)} documents, exact_match={exact_match}, similar={similar_services}")
+
+        return {
+            "found": exact_match or len(results) > 0,
+            "exact_match": exact_match,
+            "service_name": service_name,
+            "context": context,
+            "documents": results,
+            "similar_services": similar_services if not exact_match else [],
+        }
+
+    except Exception as e:
+        logger.error(f"SERVICE_RETRIEVAL: Error - {e}", exc_info=True)
+        return {
+            "found": False,
+            "service_name": service_name,
+            "context": "",
+            "documents": [],
+            "similar_services": [],
+        }
+
+# Time expressions that indicate scheduling intent
+TIME_EXPRESSIONS = [
+    r"\b(tomorrow|today|tonight)\b",
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    r"\b(next|this)\s+(week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    r"\b(at|around|by)\s+\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b",
+    r"\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b",
+    r"\b(morning|afternoon|evening|night)\b",
+    r"\b(in\s+)?\d+\s+(hour|minute|day|week)s?\b",
+]
+
+
+def _has_scheduling_keyword(text: str) -> bool:
+    """Check if text contains a scheduling keyword."""
+    text_lower = text.lower()
+    return any(keyword in text_lower for keyword in SCHEDULING_KEYWORDS)
+
+
+def _has_time_expression(text: str) -> bool:
+    """Check if text contains a time expression."""
+    text_lower = text.lower()
+    return any(re.search(pattern, text_lower) for pattern in TIME_EXPRESSIONS)
+
+
+def _is_scheduling_intent(text: str) -> bool:
+    """
+    Detect scheduling intent from text.
+    Returns True if:
+    1. Text matches calendar patterns, OR
+    2. Text contains scheduling keywords + time expression
+    """
+    # Check calendar patterns
+    if _match_patterns(text, CALENDAR_PATTERNS):
+        return True
+
+    # Scheduling keywords + time expression = scheduling intent
+    if _has_scheduling_keyword(text) and _has_time_expression(text):
+        return True
+
+    # Just scheduling keywords alone
+    if _has_scheduling_keyword(text):
+        return True
+
+    return False
 
 # Document patterns - need RAG retrieval
 DOCUMENT_PATTERNS = [
@@ -208,19 +437,19 @@ def classify_query_rules(query: str, has_documents: bool = False, awaiting_sched
     if word_count <= 3 and _match_patterns(query_clean, DIRECT_ANSWER_PATTERNS):
         return "direct", "Conversational response (no retrieval)"
 
-    # 3. Check for calendar-specific queries (scheduling actions)
-    if _match_patterns(query_clean, CALENDAR_PATTERNS):
-        return "calendar", "Calendar action detected"
+    # 3. Check for calendar-specific queries using enhanced scheduling intent detection
+    # This catches: "schedule X", "book Y", "CBC tomorrow at 3pm", "I want to book", etc.
+    if _is_scheduling_intent(query_clean):
+        return "calendar", "Scheduling intent detected"
 
     # 4. Check for sensitive topics (need human approval)
     if _match_patterns(query_clean, SENSITIVE_PATTERNS):
         return "human_approval", "Sensitive topic detected"
 
     # 5. ANY question should go to document retrieval
-    # Questions start with: what, how, why, when, where, which, who, is, are, can, do, does, tell, explain
     question_starters = [
-        "what", "how", "why", "when", "where", "which", "who",
-        "is", "are", "can", "could", "do", "does", "did",
+        "what", "how", "why", "where", "which", "who",
+        "is", "are", "could", "do", "does", "did",
         "tell", "explain", "describe", "show", "find", "get",
         "give", "list", "summarize", "define"
     ]
@@ -247,17 +476,22 @@ def classify_query_rules(query: str, has_documents: bool = False, awaiting_sched
 # ROUTING FUNCTIONS
 # =============================================================================
 
-def route_after_router(state: AgentState) -> Literal["document", "calendar", "greeting", "direct", "human_review", "scheduling_flow", "error"]:
+def route_after_router(state: AgentState) -> Literal["document", "calendar", "greeting", "direct", "human_review", "execute_scheduling", "error"]:
     """
     Route based on query classification.
 
-    IMPORTANT: "general" classification no longer exists - all substantive queries
-    go through "document" retrieval to ensure RAG is always invoked.
+    Routes:
+    - greeting: Simple greetings
+    - direct: Thanks, bye, ok, help
+    - calendar: Scheduling requests (creates pending_schedule)
+    - execute_scheduling: User confirmed with "yes" (executes booking)
+    - document: All other queries (uses RAG retrieval)
+    - human_review: Sensitive topics
     """
     if state.get("has_error"):
         return "error"
 
-    classification = state.get("query_classification", "document")  # Default to document!
+    classification = state.get("query_classification", "document")
 
     if classification == "greeting":
         return "greeting"
@@ -266,7 +500,7 @@ def route_after_router(state: AgentState) -> Literal["document", "calendar", "gr
         return "direct"
 
     if classification == "scheduling_confirmation":
-        return "scheduling_flow"
+        return "execute_scheduling"
 
     if classification == "human_approval":
         return "human_review"
@@ -274,9 +508,7 @@ def route_after_router(state: AgentState) -> Literal["document", "calendar", "gr
     if classification == "calendar":
         return "calendar"
 
-    # CRITICAL: All other queries (including "general") go through document retrieval
-    # This ensures retrieval is ALWAYS invoked for substantive queries
-    logger.info(f"Routing to document retrieval (classification={classification})")
+    # Default: document retrieval
     return "document"
 
 
@@ -319,58 +551,72 @@ async def router_node(state: AgentState) -> dict:
     """
     Classify query and determine routing.
 
-    IMPORTANT: "general" classification is remapped to "document" to ensure
-    retrieval is always invoked for substantive queries.
+    Key routing logic:
+    1. Check for scheduling confirmation ("yes" when pending schedule exists)
+    2. Classify query using enhanced rule-based patterns
+    3. Route to appropriate node
     """
     query = state.get("original_query", "")
     query_lower = query.lower().strip()
     has_documents = bool(state.get("document_ids"))
     user_id = state.get("user_id")
+    thread_id = state.get("thread_id")
 
-    logger.info(f"ROUTER: Processing query '{query}' for user {user_id}")
-
-    # Check if awaiting scheduling confirmation - first from state, then from cache
-    awaiting_scheduling = state.get("awaiting_scheduling_confirmation", False)
-    cached_pending = None
-
-    if user_id:
-        cached_pending = _get_cached_pending_schedule(user_id)
-        if cached_pending:
-            logger.info(f"ROUTER: Found cached pending schedule for user {user_id}")
-            awaiting_scheduling = True
-
-    # DIRECT CHECK: If query is a simple confirmation AND we have cached pending schedule
-    # Route directly to scheduling_flow without going through classify_query_rules
-    confirmation_words = ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm", "book it", "go ahead"]
-    if cached_pending and query_lower in confirmation_words:
-        logger.info(f"ROUTER: Direct confirmation detected with cached pending - routing to scheduling_flow")
-        updates = track_node(state, "router")
-        updates["query_classification"] = "scheduling_confirmation"
-        updates["routing_reason"] = "Direct confirmation with cached pending schedule"
-        _routing_stats["total"] += 1
-        _routing_stats["scheduling_confirmation"] = _routing_stats.get("scheduling_confirmation", 0) + 1
-        return updates
+    logger.info(f"ROUTER: ============ ROUTING START ============")
+    logger.info(f"ROUTER: Query='{query}' | user_id={user_id} | thread_id={thread_id}")
+    logger.info(f"ROUTER: Intent signals - has_scheduling={_has_scheduling_keyword(query)}, has_time={_has_time_expression(query)}")
 
     updates = track_node(state, "router")
 
-    # Use rule-based classification (fast, no LLM call)
+    # Check for pending schedule (state or cache fallback with thread_id)
+    state_pending = state.get("pending_schedule")
+    cache_pending = get_cached_pending_schedule(user_id, thread_id) if user_id else None
+    pending = state_pending or cache_pending
+
+    logger.info(f"ROUTER: State pending={state_pending is not None}, Cache pending={cache_pending is not None}")
+    if pending:
+        logger.info(f"ROUTER: Pending schedule found: {pending.get('title')} at {pending.get('datetime')}")
+
+    # If user is confirming a pending schedule
+    if pending:
+        # Extended confirmation patterns - handle various ways users say "yes"
+        confirmation_words = [
+            "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
+            "book it", "go ahead", "do it", "schedule it", "yes please",
+            "sure thing", "absolutely", "definitely", "let's do it",
+            "sounds good", "perfect", "great", "fine"
+        ]
+        # Check if query starts with or equals a confirmation word
+        is_confirmation = (
+            query_lower in confirmation_words or
+            query_lower.startswith("yes") or
+            query_lower.startswith("yeah") or
+            query_lower.startswith("sure") or
+            query_lower.startswith("ok") or
+            any(query_lower.startswith(w + " ") for w in ["yes", "yeah", "yep", "sure", "ok", "okay"])
+        )
+        logger.info(f"ROUTER: Confirmation check - query_lower='{query_lower}', is_confirmation={is_confirmation}")
+        if is_confirmation:
+            logger.info(f"ROUTER: ✅ CONFIRMATION DETECTED - routing to execute_scheduling")
+            logger.info(f"ROUTER: Pending schedule = {pending.get('title')} at {pending.get('datetime')}")
+            updates["query_classification"] = "scheduling_confirmation"
+            updates["routing_reason"] = "User confirmed pending schedule"
+            updates["pending_schedule"] = pending  # Ensure pending is in state
+            _routing_stats["total"] += 1
+            _routing_stats["scheduling_confirmation"] = _routing_stats.get("scheduling_confirmation", 0) + 1
+            logger.info(f"ROUTER: ============ ROUTING END (execute_scheduling) ============")
+            return updates
+        else:
+            logger.info(f"ROUTER: Pending exists but query is not a confirmation")
+
+    # Use rule-based classification with enhanced patterns
+    awaiting_scheduling = bool(pending)
     classification, reason = classify_query_rules(query, has_documents, awaiting_scheduling)
 
-    # Optional: Use LLM for uncertain cases (when ROUTING_USE_LLM=true)
-    if ROUTING_USE_LLM and classification == "general" and len(query.split()) > 3:
-        try:
-            llm_classification = await _classify_with_llm(query)
-            if llm_classification:
-                classification = llm_classification
-                reason = "LLM classification"
-        except Exception as e:
-            logger.warning(f"LLM classification failed: {e}, using rule-based")
-
-    # CRITICAL: Remap "general" to "document" to ensure retrieval runs
+    # Remap "general" to "document" to ensure retrieval runs
     if classification == "general":
-        logger.info(f"Remapping 'general' to 'document' to ensure retrieval executes")
         classification = "document"
-        reason = f"Remapped from general: {reason}"
+        reason = f"Remapped: {reason}"
 
     updates["query_classification"] = classification
     updates["routing_reason"] = reason
@@ -379,9 +625,8 @@ async def router_node(state: AgentState) -> dict:
     _routing_stats["total"] += 1
     _routing_stats[classification] = _routing_stats.get(classification, 0) + 1
 
-    logger.info(f"ROUTER: Query classified as '{classification}' ({reason})")
-    logger.info(f"ROUTER: Will route to -> {classification}")
-    logger.debug(f"Routing stats: {get_routing_stats()}")
+    logger.info(f"ROUTER: Final classification = '{classification}' (reason: {reason})")
+    logger.info(f"ROUTER: ============ ROUTING END ({classification}) ============")
 
     return updates
 
@@ -509,12 +754,15 @@ async def direct_node(state: AgentState) -> dict:
     return updates
 
 
-async def scheduling_flow_node(state: AgentState) -> dict:
+async def execute_scheduling_node(state: AgentState) -> dict:
     """
-    Complete booking when user confirms with 'yes'.
+    Execute the actual meeting booking when user confirms with 'yes'.
 
-    This node reads the pending_schedule from state and actually creates the meeting.
-    Falls back to user-based cache if state doesn't have pending_schedule.
+    Flow:
+    1. Get pending_schedule from state (or cache fallback)
+    2. Call schedule_meeting tool to create the meeting
+    3. Return success/error response
+    4. Clear pending schedule
     """
     from app.rag.langgraph.tools.appointment_tools import (
         schedule_meeting,
@@ -522,30 +770,25 @@ async def scheduling_flow_node(state: AgentState) -> dict:
     )
     from dateutil import parser as date_parser
 
-    updates = track_node(state, "scheduling_flow")
+    updates = track_node(state, "execute_scheduling")
     user_id = state.get("user_id")
+    thread_id = state.get("thread_id")
 
-    logger.info(f"SCHEDULING_FLOW_NODE: Starting for user {user_id}")
+    logger.info(f"EXECUTE_SCHEDULING: Starting for user {user_id}, thread {thread_id}")
 
-    # Try to get pending schedule from state first, then fallback to cache
-    pending = state.get("pending_schedule")
-    if not pending and user_id:
-        pending = _get_cached_pending_schedule(user_id)
-        if pending:
-            logger.info(f"SCHEDULING_FLOW_NODE: Using cached pending schedule: {pending}")
+    # Get pending schedule from state or cache (with thread_id)
+    pending = state.get("pending_schedule") or get_cached_pending_schedule(user_id, thread_id)
 
     if not pending:
-        # No pending meeting - ask what they want to book
-        logger.warning("SCHEDULING_FLOW_NODE: No pending schedule found!")
+        logger.warning("EXECUTE_SCHEDULING: No pending schedule found!")
         updates["response"] = "I don't have a pending appointment to book. What would you like to schedule?"
         updates["should_end"] = False
         updates["messages"] = [AIMessage(content=updates["response"])]
         return updates
 
-    logger.info(f"SCHEDULING_FLOW_NODE: Scheduling - title={pending.get('title')}, datetime={pending.get('datetime')}")
+    logger.info(f"EXECUTE_SCHEDULING: Booking - {pending.get('title')} at {pending.get('datetime')}")
 
-    # Call the schedule_meeting tool with timezone
-    user_timezone = pending.get("user_timezone") or state.get("user_timezone", "UTC")
+    # Call the schedule_meeting tool
     try:
         result = await schedule_meeting.ainvoke({
             "title": pending["title"],
@@ -553,18 +796,48 @@ async def scheduling_flow_node(state: AgentState) -> dict:
             "duration_minutes": pending.get("duration", 60),
             "participants": pending.get("attendees"),
             "user_id": user_id or pending.get("user_id"),
-            "timezone": user_timezone,
         })
 
-        logger.info(f"SCHEDULING_FLOW_NODE: schedule_meeting result: {result}")
+        logger.info(f"EXECUTE_SCHEDULING: Result = {result}")
 
         if result.get("success"):
             updates["scheduled_meeting"] = result
             updates["response"] = format_meeting_success(result)
-            logger.info(f"Meeting scheduled successfully: {result.get('meeting_id')}")
+
+            # Log complete calendar event details
+            logger.info("=" * 60)
+            logger.info("📅 CALENDAR EVENT CREATED SUCCESSFULLY")
+            logger.info("=" * 60)
+            logger.info(f"  Meeting ID:    {result.get('meeting_id')}")
+            logger.info(f"  Title:         {result.get('title')}")
+            logger.info(f"  Start Time:    {result.get('start_time')}")
+            logger.info(f"  End Time:      {result.get('end_time')}")
+            logger.info(f"  Duration:      {result.get('duration_minutes')} minutes")
+            logger.info(f"  Participants:  {result.get('participants', [])}")
+            logger.info(f"  Location:      {result.get('location', 'Not specified')}")
+            logger.info(f"  Status:        {result.get('status')}")
+            logger.info(f"  Storage:       {result.get('source', 'unknown')}")
+            if result.get('calendar_link'):
+                logger.info(f"  Calendar Link: {result.get('calendar_link')}")
+            if result.get('google_meet_link'):
+                logger.info(f"  Meet Link:     {result.get('google_meet_link')}")
+            if result.get('note'):
+                logger.info(f"  Note:          {result.get('note')}")
+            logger.info("=" * 60)
         else:
             error_msg = result.get('message') or result.get('error') or 'Unknown error'
             updates["response"] = f"Sorry, I couldn't schedule the appointment: {error_msg}"
+
+            # Log failed calendar event
+            logger.warning("=" * 60)
+            logger.warning("❌ CALENDAR EVENT CREATION FAILED")
+            logger.warning("=" * 60)
+            logger.warning(f"  Error: {error_msg}")
+            logger.warning(f"  Pending Title: {pending.get('title')}")
+            logger.warning(f"  Pending Time: {pending.get('datetime')}")
+            logger.warning("=" * 60)
+
+            # Show alternative slots if available
             if result.get("alternative_slots"):
                 updates["response"] += "\n\n**Alternative times available:**\n"
                 for slot in result["alternative_slots"][:3]:
@@ -575,20 +848,17 @@ async def scheduling_flow_node(state: AgentState) -> dict:
                         updates["response"] += f"- {slot['start']}\n"
 
     except Exception as e:
-        logger.error(f"SCHEDULING_FLOW_NODE: Error - {e}", exc_info=True)
+        logger.error(f"EXECUTE_SCHEDULING: Error - {e}", exc_info=True)
         updates["response"] = f"I encountered an error while scheduling: {str(e)}. Please try again."
 
-    # Clear pending state
+    # Clear pending schedule from state and cache
     updates["pending_schedule"] = None
     updates["awaiting_scheduling_confirmation"] = False
     updates["should_end"] = True
     updates["messages"] = [AIMessage(content=updates["response"])]
 
-    # Clear the user cache as well
     if user_id:
-        _clear_cached_pending_schedule(user_id)
-
-    logger.info(f"SCHEDULING_FLOW_NODE: Completed with response: {updates['response'][:100]}...")
+        clear_cached_pending_schedule(user_id, thread_id)
 
     return updates
 
@@ -692,6 +962,43 @@ CHAT HISTORY FOR CONTEXT:
 (Use this to resolve references like 'it' or 'the test' from previous messages)"""
 
 
+def _extract_title_from_query(query: str) -> str:
+    """
+    Extract appointment title from query.
+    Simple approach: remove scheduling keywords and time expressions, use remainder as title.
+    """
+    import re
+
+    text = query.strip()
+
+    # Remove common scheduling phrases
+    scheduling_phrases = [
+        r'\b(schedule|book|set up|create|make|reserve)\s+(a|an|my|the)?\s*',
+        r'\b(appointment|meeting|session)\s+(for|at|on)?\s*',
+        r'\b(i\s+want|i\s+need|i\'d\s+like|can\s+you|please)\s+(to\s+)?',
+        r'\b(tomorrow|today|tonight)\s+(at\s+)?',
+        r'\b(next\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(at\s+)?',
+        r'\b(at|around|by)\s+\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b',
+        r'\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b',
+        r'\b(morning|afternoon|evening)\b',
+        r'\b(for\s+)?\d+\s+(hour|minute|min)s?\b',
+    ]
+
+    cleaned = text
+    for pattern in scheduling_phrases:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+
+    # Clean up whitespace
+    cleaned = ' '.join(cleaned.split()).strip()
+
+    # If we have something left, use it as title
+    if cleaned and len(cleaned) > 2:
+        return cleaned.title()
+
+    # Fallback to "Appointment"
+    return "Appointment"
+
+
 # Cache the agent to avoid recreating it each time
 _calendar_agent_cache = None
 
@@ -706,18 +1013,18 @@ def get_calendar_agent():
 
 async def calendar_node(state: AgentState) -> dict:
     """
-    Handle calendar/appointment queries using a ReAct agent with tools.
+    Handle calendar/appointment queries.
 
-    The agent will:
-    1. Parse the user's calendar request
-    2. Use appropriate tools (check_calendar, schedule_meeting, etc.)
-    3. Return actual results from tool execution
+    Flow:
+    1. Retrieve service info from documents using RAG
+    2. Parse the user's scheduling request
+    3. Ask for confirmation
+    4. On confirmation, execute_scheduling_node handles actual booking
     """
     from app.rag.langgraph.tools.appointment_tools import (
         parse_natural_datetime_enhanced,
         extract_duration,
         extract_attendees,
-        extract_meeting_title,
         format_confirmation_request,
     )
 
@@ -731,26 +1038,34 @@ async def calendar_node(state: AgentState) -> dict:
     try:
         query_lower = query.lower()
 
-        # Check if this looks like a datetime input (follow-up to previous scheduling request)
-        datetime_keywords = ["tomorrow", "today", "tonight", "monday", "tuesday", "wednesday",
-                            "thursday", "friday", "saturday", "sunday", "next", "at ", "pm", "am",
-                            "morning", "afternoon", "evening", "in 1", "in 2", "in 3"]
-        is_datetime_input = any(kw in query_lower for kw in datetime_keywords)
+        # Check if this is a scheduling request vs calendar check
+        is_availability_check = any(word in query_lower for word in ["available", "free", "check", "what's on", "show my", "view"])
 
-        # Check if this is a scheduling request OR a datetime follow-up
-        is_scheduling_request = any(word in query_lower for word in ["schedule", "book", "create", "set up"])
+        if not is_availability_check:
+            # First, retrieve service info from documents
+            service_info = await retrieve_service_from_documents(query, user_id)
+            title = service_info.get("service_name", "Appointment")
+            doc_context = service_info.get("context", "")
+            similar_services = service_info.get("similar_services", [])
+            exact_match = service_info.get("exact_match", False)
 
-        # Get scheduling context from previous messages (for follow-up datetime inputs)
-        scheduling_context = state.get("scheduling_context", "")
+            logger.info(f"CALENDAR: Retrieved service '{title}' from documents, found={service_info.get('found')}, exact_match={exact_match}")
 
-        # If it's a scheduling request OR looks like a datetime input (possible follow-up)
-        if is_scheduling_request or (is_datetime_input and not any(word in query_lower for word in ["available", "free", "check", "what", "show"])):
+            # If no exact match found and we have similar services, suggest them
+            if not exact_match and similar_services and not service_info.get("found"):
+                suggestions = "\n".join([f"  - {svc}" for svc in similar_services])
+                updates["response"] = (
+                    f"I couldn't find '{title}' in your documents. Did you mean one of these?\n\n"
+                    f"{suggestions}\n\n"
+                    f"Please try again with the correct service name and time."
+                )
+                updates["messages"] = [AIMessage(content=updates["response"])]
+                return updates
+
             # Parse datetime from user query
             parsed = parse_natural_datetime_enhanced(query, user_timezone)
 
             if not parsed["datetime"]:
-                # Store context for follow-up
-                updates["scheduling_context"] = query
                 updates["response"] = (
                     "I couldn't understand the date/time. Please specify like:\n"
                     "- 'tomorrow at 2pm'\n"
@@ -763,20 +1078,13 @@ async def calendar_node(state: AgentState) -> dict:
             duration = extract_duration(query)
             attendees = extract_attendees(query)
 
-            # Extract title from current query OR use context from previous message
-            title = extract_meeting_title(query)
-            if title == "Meeting" and scheduling_context:
-                # Try to get a better title from previous context
-                title = extract_meeting_title(scheduling_context)
-
-            # Store pending schedule for confirmation
+            # Store pending schedule for confirmation (include document context)
             pending_schedule = {
                 "datetime": parsed["datetime"].isoformat(),
                 "duration": duration,
                 "attendees": attendees,
                 "title": title,
                 "user_id": user_id,
-                "user_timezone": user_timezone,
                 "document_context": doc_context[:500] if doc_context else "",
             }
             updates["pending_schedule"] = pending_schedule
@@ -787,19 +1095,22 @@ async def calendar_node(state: AgentState) -> dict:
             updates["calendar_action"] = "pending_schedule"
             updates["messages"] = [AIMessage(content=updates["response"])]
 
-            # Also cache by user_id as fallback for when thread_id isn't preserved
-            _cache_pending_schedule(user_id, pending_schedule)
+            # Also store retrieved documents for reference
+            if service_info.get("documents"):
+                updates["documents"] = service_info["documents"]
+
+            # Cache for state persistence
+            thread_id = state.get("thread_id")
+            cache_pending_schedule(user_id, pending_schedule, thread_id)
 
             return updates
 
-        # For non-scheduling queries, use the ReAct agent with tools
+        # For availability checks, use the ReAct agent with tools
         agent = get_calendar_agent()
 
-        # Prepare context for the agent
         from datetime import datetime
         current_date = datetime.now().strftime("%Y-%m-%d")
 
-        # Build chat history from state messages for context
         state_messages = state.get("messages", [])
         chat_history = ""
         if state_messages:
@@ -811,10 +1122,8 @@ async def calendar_node(state: AgentState) -> dict:
         if not chat_history:
             chat_history = "(No previous messages)"
 
-        # Get the optimized system prompt with dynamic values
         system_prompt = _get_calendar_system_prompt(current_date, chat_history)
 
-        # Create messages for the agent with system prompt
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"""User: {user_name}
@@ -902,16 +1211,33 @@ class AgentGraphBuilder:
         self._interrupt_before: list[str] = []
 
     def with_postgres_checkpointer(self, connection_string: str) -> "AgentGraphBuilder":
-        """Add PostgreSQL checkpointing."""
+        """
+        Add PostgreSQL checkpointing using connection pool.
+
+        Note: PostgresSaver requires proper connection management.
+        Falls back to MemorySaver if PostgreSQL setup fails.
+        """
         try:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-            self._checkpointer = AsyncPostgresSaver.from_conn_string(connection_string)
-            logger.info("PostgreSQL checkpointer configured")
-        except ImportError:
-            logger.warning("AsyncPostgresSaver not available, using memory")
+            from langgraph.checkpoint.postgres import PostgresSaver
+            from psycopg_pool import ConnectionPool
+
+            # Create connection pool for PostgresSaver
+            pool = ConnectionPool(connection_string, min_size=1, max_size=10)
+            self._checkpointer = PostgresSaver(pool)
+
+            # Setup the checkpoint tables if they don't exist
+            try:
+                self._checkpointer.setup()
+            except Exception as setup_err:
+                logger.warning(f"Checkpoint table setup warning (may already exist): {setup_err}")
+
+            logger.info("PostgreSQL checkpointer configured with connection pool")
+        except ImportError as ie:
+            logger.warning(f"PostgreSQL dependencies not available ({ie}), using memory checkpointer. "
+                          "Install with: pip install langgraph-checkpoint-postgres psycopg-pool")
             self._checkpointer = MemorySaver()
         except Exception as e:
-            logger.error(f"Checkpointer error: {e}")
+            logger.error(f"PostgreSQL checkpointer error: {e}, falling back to memory")
             self._checkpointer = MemorySaver()
         return self
 
@@ -930,14 +1256,13 @@ class AgentGraphBuilder:
         workflow = StateGraph(AgentState)
 
         # Add nodes
-        # NOTE: "general" node removed - all substantive queries go through "document"
         workflow.add_node("entry", entry_node)
         workflow.add_node("router", router_node)
-        workflow.add_node("document", document_node)  # ALWAYS runs retrieval
+        workflow.add_node("document", document_node)
         workflow.add_node("calendar", calendar_node)
         workflow.add_node("greeting", greeting_node)
-        workflow.add_node("direct", direct_node)  # Handles simple responses (thanks, bye, etc.)
-        workflow.add_node("scheduling_flow", scheduling_flow_node)  # Handles scheduling confirmation
+        workflow.add_node("direct", direct_node)
+        workflow.add_node("execute_scheduling", execute_scheduling_node)  # Executes booking on "yes"
         workflow.add_node("human_review", human_review_node)
         workflow.add_node("response", response_node)
         workflow.add_node("error", error_node)
@@ -948,17 +1273,16 @@ class AgentGraphBuilder:
         # Edges
         workflow.add_edge("entry", "router")
 
-        # CRITICAL: No "general" route - all queries either go to specific handlers
-        # or through document retrieval
+        # Route based on query classification
         workflow.add_conditional_edges(
             "router",
             route_after_router,
             {
-                "document": "document",  # ALL substantive queries go here
+                "document": "document",
                 "calendar": "calendar",
                 "greeting": "greeting",
-                "direct": "direct",  # Only for: thanks, bye, ok, help, who are you
-                "scheduling_flow": "scheduling_flow",  # User confirmed scheduling
+                "direct": "direct",
+                "execute_scheduling": "execute_scheduling",  # User said "yes" to confirm
                 "human_review": "human_review",
                 "error": "error",
             }
@@ -989,7 +1313,7 @@ class AgentGraphBuilder:
         )
 
         workflow.add_edge("greeting", END)
-        workflow.add_edge("scheduling_flow", END)  # Scheduling flow ends after asking for details
+        workflow.add_edge("execute_scheduling", END)  # Booking confirmed, ends conversation
         workflow.add_edge("response", END)
         workflow.add_edge("error", END)
 
@@ -1036,6 +1360,16 @@ class Agent:
 
         self._graph = builder.build()
 
+    # Words that should NEVER be cached (confirmations, short responses)
+    UNCACHEABLE_QUERIES = {
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
+        "no", "nope", "nah", "cancel", "nevermind", "never mind",
+        "book it", "go ahead", "do it", "schedule it", "yes please",
+        "sure thing", "absolutely", "definitely", "let's do it",
+        "sounds good", "perfect", "great", "fine", "thanks", "thank you",
+        "hi", "hello", "hey", "bye", "goodbye",
+    }
+
     async def invoke(
         self,
         query: str,
@@ -1049,11 +1383,24 @@ class Agent:
         """Invoke agent with a query, with optional caching."""
         from app.rag.cache import get_cached_response, set_cached_response
 
-        # Try cache first for document queries (skip for calendar/stateful queries)
-        if use_cache and not document_ids:  # Only cache general queries
+        query_lower = query.lower().strip()
+        word_count = len(query_lower.split())
+
+        # NEVER cache short queries or confirmation words - they are context-dependent
+        is_uncacheable = (
+            word_count <= 3 or  # Short queries are context-dependent
+            query_lower in self.UNCACHEABLE_QUERIES or
+            any(query_lower.startswith(w) for w in ["yes", "yeah", "sure", "ok", "no", "nope"])
+        )
+
+        # Check for pending schedule - if exists, skip cache entirely
+        has_pending = bool(get_cached_pending_schedule(user_id, thread_id)) if user_id else False
+
+        # Try cache first ONLY for longer document queries without pending state
+        if use_cache and not document_ids and not is_uncacheable and not has_pending:
             cached = await get_cached_response(query, user_id)
             if cached:
-                logger.info(f"Cache HIT: returning cached response")
+                logger.info(f"Cache HIT: returning cached response for '{query[:30]}...'")
                 return {
                     "response": cached.get("response", ""),
                     "thread_id": thread_id or "",
@@ -1063,6 +1410,8 @@ class Agent:
                     "metrics": {"cache_hit": True},
                     "from_cache": True,
                 }
+        elif is_uncacheable or has_pending:
+            logger.info(f"Cache SKIP: query='{query_lower}' is_uncacheable={is_uncacheable} has_pending={has_pending}")
 
         # For continuing conversations, only pass minimal input to preserve state
         # The checkpointer will load previous state (pending_schedule, etc.)
@@ -1159,9 +1508,44 @@ class Agent:
 def create_agent(
     database_url: Optional[str] = None,
     enable_human_review: bool = False,
+    use_postgres_checkpointer: bool = False,
 ) -> Agent:
-    """Create an agent instance."""
-    return Agent(database_url=database_url, enable_human_review=enable_human_review)
+    """
+    Create an agent instance.
+
+    Args:
+        database_url: PostgreSQL connection string (optional)
+        enable_human_review: Enable human-in-the-loop review
+        use_postgres_checkpointer: If True, try to use PostgreSQL for checkpointing
+
+    Note: By default uses MemorySaver which works reliably.
+    PostgreSQL checkpointing requires psycopg-pool package.
+    State persistence for scheduling is handled by _pending_schedule_cache.
+    """
+    # Only use PostgreSQL if explicitly requested and URL is available
+    if use_postgres_checkpointer and database_url is None:
+        try:
+            from app.core.config import settings
+            database_url = settings.database_url
+            if database_url:
+                logger.info("Using PostgreSQL checkpointer from settings.database_url")
+        except Exception as e:
+            logger.warning(f"Could not load database URL from settings: {e}")
+            database_url = None
+
+    return Agent(
+        database_url=database_url if use_postgres_checkpointer else None,
+        enable_human_review=enable_human_review
+    )
 
 
-__all__ = ["AgentGraphBuilder", "Agent", "create_agent", "get_routing_stats", "classify_query_rules"]
+__all__ = [
+    "AgentGraphBuilder",
+    "Agent",
+    "create_agent",
+    "get_routing_stats",
+    "classify_query_rules",
+    "_is_scheduling_intent",
+    "_has_scheduling_keyword",
+    "_has_time_expression",
+]

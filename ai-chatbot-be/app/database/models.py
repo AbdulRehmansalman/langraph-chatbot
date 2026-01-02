@@ -214,6 +214,8 @@ class UserGoogleAuth(Base):
         return {
             "id": str(self.id),
             "user_id": str(self.user_id),
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
             "has_token": bool(self.access_token),
             "has_refresh": bool(self.refresh_token),
             "token_expiry": self.token_expiry.isoformat() if self.token_expiry else None,

@@ -330,28 +330,63 @@ class GoogleCalendarService:
             True if initialization successful, False otherwise
         """
         try:
+            # Check for required OAuth configuration
+            client_id = self._get_client_id()
+            client_secret = self._get_client_secret()
+
+            if not client_id or not client_secret:
+                logger.warning(
+                    f"Google OAuth not configured (missing client_id or client_secret). "
+                    f"Calendar sync disabled for user {self.user_id}"
+                )
+                return False
+
             # Load credentials from database
             credentials_data = await self._load_credentials()
 
             if not credentials_data:
-                logger.warning(f"No Google credentials found for user {self.user_id}")
+                logger.warning(f"No Google credentials found for user {self.user_id}. User needs to connect Google Calendar.")
+                return False
+
+            # Check for required fields
+            access_token = credentials_data.get("access_token")
+            refresh_token = credentials_data.get("refresh_token")
+
+            if not access_token:
+                logger.warning(f"No access_token found for user {self.user_id}")
+                return False
+
+            if not refresh_token:
+                logger.warning(f"No refresh_token found for user {self.user_id}. User needs to re-authorize Google Calendar.")
                 return False
 
             # Create credentials object
             self._credentials = Credentials(
-                token=credentials_data.get("access_token"),
-                refresh_token=credentials_data.get("refresh_token"),
+                token=access_token,
+                refresh_token=refresh_token,
                 token_uri="https://oauth2.googleapis.com/token",
-                client_id=self._get_client_id(),
-                client_secret=self._get_client_secret(),
+                client_id=client_id,
+                client_secret=client_secret,
                 scopes=credentials_data.get("scopes", [
                     "https://www.googleapis.com/auth/calendar",
                     "https://www.googleapis.com/auth/calendar.events"
                 ])
             )
 
-            # Refresh if expired
-            if self._credentials.expired and self._credentials.refresh_token:
+            # Proactively refresh if expired OR about to expire (within 30 minutes)
+            should_refresh = False
+            if self._credentials.expired:
+                should_refresh = True
+                logger.info(f"Token expired for user {self.user_id}, refreshing...")
+            elif self._credentials.expiry:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                time_until_expiry = (self._credentials.expiry - now).total_seconds()
+                if time_until_expiry < 1800:  # Less than 30 minutes
+                    should_refresh = True
+                    logger.info(f"Token expires in {time_until_expiry/60:.0f} minutes for user {self.user_id}, refreshing proactively...")
+
+            if should_refresh and self._credentials.refresh_token:
                 await self._refresh_credentials()
 
             # Build service
@@ -362,7 +397,7 @@ class GoogleCalendarService:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to initialize calendar service: {e}")
+            logger.error(f"Failed to initialize calendar service for user {self.user_id}: {e}")
             return False
 
     def _get_client_id(self) -> str:
@@ -380,12 +415,17 @@ class GoogleCalendarService:
         try:
             from app.services.supabase_client import supabase_client
 
+            logger.info(f"GOOGLE_AUTH: Loading credentials for user {self.user_id}")
             result = supabase_client.table("user_google_auth").select("*").eq(
                 "user_id", self.user_id
             ).execute()
 
             if result.data:
-                return result.data[0]
+                creds = result.data[0]
+                logger.info(f"GOOGLE_AUTH: Found credentials - has_token={creds.get('has_token')}, has_refresh={creds.get('has_refresh')}")
+                return creds
+            else:
+                logger.warning(f"GOOGLE_AUTH: No credentials found in user_google_auth for user {self.user_id}")
             return None
 
         except Exception as e:
@@ -998,28 +1038,66 @@ class GoogleCalendarService:
             }
 
 
-# Singleton instance cache
+# Singleton instance cache with expiry tracking
 _calendar_services: dict[str, GoogleCalendarService] = {}
+_service_created_at: dict[str, float] = {}
+
+# Token refresh interval - refresh before 12 hours to prevent disconnection
+TOKEN_REFRESH_INTERVAL_SECONDS = 10 * 60 * 60  # 10 hours (refresh before 12 hour expiry)
 
 
-async def get_calendar_service(user_id: str) -> GoogleCalendarService:
+async def get_calendar_service(user_id: str) -> Optional[GoogleCalendarService]:
     """
     Get or create a calendar service for a user.
+
+    Handles automatic token refresh by:
+    - Checking service age and reinitializing if > 10 hours
+    - Clearing cached services that may have stale tokens
 
     Args:
         user_id: User ID
 
     Returns:
-        Initialized GoogleCalendarService
+        Initialized GoogleCalendarService or None if not available
     """
-    if user_id not in _calendar_services:
-        service = GoogleCalendarService(user_id)
-        if await service.initialize():
-            _calendar_services[user_id] = service
-        else:
-            raise CalendarError(f"Failed to initialize calendar service for user {user_id}")
+    import time
 
-    return _calendar_services[user_id]
+    current_time = time.time()
+
+    # Check if we have a cached service
+    if user_id in _calendar_services:
+        # Check if service is too old and needs refresh
+        created_at = _service_created_at.get(user_id, 0)
+        age = current_time - created_at
+
+        if age > TOKEN_REFRESH_INTERVAL_SECONDS:
+            logger.info(f"Calendar service for user {user_id} is {age/3600:.1f} hours old, refreshing...")
+            # Clear stale service
+            del _calendar_services[user_id]
+            if user_id in _service_created_at:
+                del _service_created_at[user_id]
+        else:
+            # Service is still fresh, return it
+            return _calendar_services.get(user_id)
+
+    # Create new service
+    service = GoogleCalendarService(user_id)
+    if await service.initialize():
+        _calendar_services[user_id] = service
+        _service_created_at[user_id] = current_time
+        logger.info(f"Created fresh calendar service for user {user_id}")
+        return service
+    else:
+        # Return None instead of raising - caller should fall back to Supabase
+        logger.warning("=" * 60)
+        logger.warning("⚠️  GOOGLE CALENDAR NOT AVAILABLE")
+        logger.warning("=" * 60)
+        logger.warning(f"  User ID: {user_id}")
+        logger.warning(f"  Reason: User needs to connect Google Calendar via OAuth")
+        logger.warning(f"  Action: Events will be saved to Supabase database instead")
+        logger.warning(f"  To fix: Have user go to Settings > Connect Google Calendar")
+        logger.warning("=" * 60)
+        return None
 
 
 def clear_calendar_service_cache(user_id: Optional[str] = None):
@@ -1031,5 +1109,7 @@ def clear_calendar_service_cache(user_id: Optional[str] = None):
     """
     if user_id:
         _calendar_services.pop(user_id, None)
+        _service_created_at.pop(user_id, None)
     else:
         _calendar_services.clear()
+        _service_created_at.clear()

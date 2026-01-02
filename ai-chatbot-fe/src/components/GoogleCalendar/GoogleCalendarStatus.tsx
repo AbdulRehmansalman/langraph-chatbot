@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { googleCalendarAPI } from '../../services/api';
 import type { GoogleAuthStatus } from '../../types';
@@ -6,6 +6,8 @@ import type { GoogleAuthStatus } from '../../types';
 const GoogleCalendarStatus: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState(false);
   const queryClient = useQueryClient();
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const {
     data: status,
@@ -14,28 +16,65 @@ const GoogleCalendarStatus: React.FC = () => {
   } = useQuery<GoogleAuthStatus>({
     queryKey: ['google-calendar-status'],
     queryFn: googleCalendarAPI.getStatus,
+    // Only refetch when window regains focus if not connecting
+    refetchOnWindowFocus: !isConnecting,
+    // Disable automatic refetching - we control it manually when connecting
+    refetchInterval: false,
   });
+
+  // Stop polling when connected
+  useEffect(() => {
+    if (status?.connected && isConnecting) {
+      stopPolling();
+      setIsConnecting(false);
+    }
+  }, [status?.connected, isConnecting]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopPolling();
+    };
+  }, []);
+
+  const stopPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (pollTimeoutRef.current) {
+      clearTimeout(pollTimeoutRef.current);
+      pollTimeoutRef.current = null;
+    }
+  };
+
+  const startPolling = () => {
+    // Clear any existing polling
+    stopPolling();
+
+    // Poll every 5 seconds (less aggressive)
+    pollIntervalRef.current = setInterval(() => {
+      queryClient.invalidateQueries({ queryKey: ['google-calendar-status'] });
+    }, 5000);
+
+    // Stop polling after 2 minutes max
+    pollTimeoutRef.current = setTimeout(() => {
+      stopPolling();
+      setIsConnecting(false);
+    }, 120000);
+  };
 
   const connectMutation = useMutation({
     mutationFn: googleCalendarAPI.startAuth,
     onSuccess: data => {
       window.open(data.auth_url, '_blank');
       setIsConnecting(true);
-
-      // Poll for status changes
-      const pollInterval = setInterval(() => {
-        queryClient.invalidateQueries({ queryKey: ['google-calendar-status'] });
-      }, 2000);
-
-      // Stop polling after 2 minutes
-      setTimeout(() => {
-        clearInterval(pollInterval);
-        setIsConnecting(false);
-      }, 120000);
+      startPolling();
     },
     onError: error => {
       console.error('Failed to start Google Calendar auth:', error);
       setIsConnecting(false);
+      stopPolling();
     },
   });
 
@@ -104,7 +143,7 @@ const GoogleCalendarStatus: React.FC = () => {
       {isConnecting && (
         <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded">
           <p className="text-sm text-blue-700">
-            📅 Complete the authorization in the opened tab, then return here. This status will
+            Complete the authorization in the opened tab, then return here. This status will
             update automatically.
           </p>
         </div>

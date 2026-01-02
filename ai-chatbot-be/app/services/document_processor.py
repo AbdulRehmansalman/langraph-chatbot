@@ -17,6 +17,17 @@ from app.rag.embeddings.service import EmbeddingsService, get_embeddings_service
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_text(text: str) -> str:
+    """
+    Remove NUL and other problematic characters from text.
+    PostgreSQL cannot store NUL (0x00) characters in text fields.
+    """
+    if not text:
+        return ""
+    # Remove NUL characters and other control characters (except newline, tab, carriage return)
+    return ''.join(char for char in text if char == '\n' or char == '\t' or char == '\r' or (ord(char) >= 32 and ord(char) != 127))
+
+
 class DocumentProcessor:
     """
     Production document processor.
@@ -148,26 +159,42 @@ class DocumentProcessor:
         Returns:
             Number of chunks stored
         """
-        # Extract texts for embedding
-        texts = [chunk.page_content for chunk in chunks]
+        # Extract and sanitize texts for embedding
+        texts = [_sanitize_text(chunk.page_content) for chunk in chunks]
+
+        # Filter out empty chunks after sanitization
+        valid_chunks = [(chunk, text) for chunk, text in zip(chunks, texts) if text.strip()]
+
+        if not valid_chunks:
+            logger.warning(f"No valid content after sanitization for document {document_id}")
+            return 0
+
+        texts = [text for _, text in valid_chunks]
+        chunks_to_process = [chunk for chunk, _ in valid_chunks]
 
         # Generate embeddings
         embeddings = self.embeddings_service.embed_documents(texts)
 
         # Prepare records for insertion
         records = []
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        for i, (chunk, text, embedding) in enumerate(zip(chunks_to_process, texts, embeddings)):
+            # Sanitize metadata values that might contain NUL characters
             chunk_metadata = {
                 "document_id": document_id,
                 "chunk_index": i,
-                "source": chunk.metadata.get("source", ""),
-                **(chunk.metadata or {}),
-                **(metadata or {}),
+                "source": _sanitize_text(str(chunk.metadata.get("source", ""))),
             }
+            # Add other metadata, sanitizing string values
+            for key, value in (chunk.metadata or {}).items():
+                if key not in chunk_metadata:
+                    chunk_metadata[key] = _sanitize_text(str(value)) if isinstance(value, str) else value
+            for key, value in (metadata or {}).items():
+                if key not in chunk_metadata:
+                    chunk_metadata[key] = _sanitize_text(str(value)) if isinstance(value, str) else value
 
             records.append({
                 "document_id": document_id,
-                "content": chunk.page_content,
+                "content": text,  # Already sanitized
                 "embedding": embedding,
                 "metadata": chunk_metadata,
                 "chunk_index": i,
