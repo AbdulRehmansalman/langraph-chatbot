@@ -544,24 +544,16 @@ async def scheduling_flow_node(state: AgentState) -> dict:
 
     logger.info(f"SCHEDULING_FLOW_NODE: Scheduling - title={pending.get('title')}, datetime={pending.get('datetime')}")
 
-<<<<<<< Updated upstream
-    # Actually create the meeting
-=======
     # Call the schedule_meeting tool with timezone
     user_timezone = pending.get("user_timezone") or state.get("user_timezone", "UTC")
->>>>>>> Stashed changes
     try:
         result = await schedule_meeting.ainvoke({
             "title": pending["title"],
             "datetime_str": pending["datetime"],
             "duration_minutes": pending.get("duration", 60),
             "participants": pending.get("attendees"),
-<<<<<<< Updated upstream
-            "user_id": pending.get("user_id"),
-=======
             "user_id": user_id or pending.get("user_id"),
             "timezone": user_timezone,
->>>>>>> Stashed changes
         })
 
         logger.info(f"SCHEDULING_FLOW_NODE: schedule_meeting result: {result}")
@@ -784,11 +776,8 @@ async def calendar_node(state: AgentState) -> dict:
                 "attendees": attendees,
                 "title": title,
                 "user_id": user_id,
-<<<<<<< Updated upstream
-=======
                 "user_timezone": user_timezone,
                 "document_context": doc_context[:500] if doc_context else "",
->>>>>>> Stashed changes
             }
             updates["pending_schedule"] = pending_schedule
             updates["awaiting_scheduling_confirmation"] = True
