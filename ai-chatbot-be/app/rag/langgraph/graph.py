@@ -544,14 +544,24 @@ async def scheduling_flow_node(state: AgentState) -> dict:
 
     logger.info(f"SCHEDULING_FLOW_NODE: Scheduling - title={pending.get('title')}, datetime={pending.get('datetime')}")
 
+<<<<<<< Updated upstream
     # Actually create the meeting
+=======
+    # Call the schedule_meeting tool with timezone
+    user_timezone = pending.get("user_timezone") or state.get("user_timezone", "UTC")
+>>>>>>> Stashed changes
     try:
         result = await schedule_meeting.ainvoke({
             "title": pending["title"],
             "datetime_str": pending["datetime"],
             "duration_minutes": pending.get("duration", 60),
             "participants": pending.get("attendees"),
+<<<<<<< Updated upstream
             "user_id": pending.get("user_id"),
+=======
+            "user_id": user_id or pending.get("user_id"),
+            "timezone": user_timezone,
+>>>>>>> Stashed changes
         })
 
         logger.info(f"SCHEDULING_FLOW_NODE: schedule_meeting result: {result}")
@@ -721,7 +731,7 @@ async def calendar_node(state: AgentState) -> dict:
 
     query = state.get("original_query", "")
     user_id = state.get("user_id")
-    timezone = state.get("timezone", "UTC")
+    user_timezone = state.get("user_timezone", "UTC")
     user_name = state.get("user_name", "User")
 
     updates = track_node(state, "calendar")
@@ -744,7 +754,7 @@ async def calendar_node(state: AgentState) -> dict:
         # If it's a scheduling request OR looks like a datetime input (possible follow-up)
         if is_scheduling_request or (is_datetime_input and not any(word in query_lower for word in ["available", "free", "check", "what", "show"])):
             # Parse datetime from user query
-            parsed = parse_natural_datetime_enhanced(query, timezone)
+            parsed = parse_natural_datetime_enhanced(query, user_timezone)
 
             if not parsed["datetime"]:
                 # Store context for follow-up
@@ -774,6 +784,11 @@ async def calendar_node(state: AgentState) -> dict:
                 "attendees": attendees,
                 "title": title,
                 "user_id": user_id,
+<<<<<<< Updated upstream
+=======
+                "user_timezone": user_timezone,
+                "document_context": doc_context[:500] if doc_context else "",
+>>>>>>> Stashed changes
             }
             updates["pending_schedule"] = pending_schedule
             updates["awaiting_scheduling_confirmation"] = True
@@ -815,7 +830,7 @@ async def calendar_node(state: AgentState) -> dict:
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"""User: {user_name}
 User ID: {user_id}
-Timezone: {timezone}
+Timezone: {user_timezone}
 
 User request: {query}
 
@@ -1037,6 +1052,7 @@ class Agent:
         query: str,
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        user_timezone: Optional[str] = None,
         document_ids: Optional[list[str]] = None,
         thread_id: Optional[str] = None,
         use_cache: bool = True,
@@ -1079,6 +1095,7 @@ class Agent:
             "original_query": query,
             "user_id": user_id,
             "user_name": user_name or "User",
+            "user_timezone": user_timezone or "UTC",
             "document_ids": document_ids,
             "thread_id": effective_thread_id,
         }

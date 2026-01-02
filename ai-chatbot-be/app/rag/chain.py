@@ -57,6 +57,27 @@ class RAGChainAdapter:
         self.user_id = user_id
         self.document_ids = document_ids
         self.thread_id = thread_id
+        self._user_timezone: Optional[str] = None
+
+    def _get_user_timezone(self) -> str:
+        """Fetch user's timezone from database. Cached for the session."""
+        if self._user_timezone is not None:
+            return self._user_timezone
+
+        try:
+            from app.services.supabase_client import supabase_client
+            result = supabase_client.table("users").select("timezone").eq("id", self.user_id).execute()
+            if result.data and result.data[0].get("timezone"):
+                self._user_timezone = result.data[0]["timezone"]
+                logger.info(f"User timezone loaded: {self._user_timezone}")
+            else:
+                self._user_timezone = "UTC"
+                logger.info(f"No timezone for user {self.user_id}, defaulting to UTC")
+        except Exception as e:
+            logger.warning(f"Failed to fetch user timezone: {e}, defaulting to UTC")
+            self._user_timezone = "UTC"
+
+        return self._user_timezone
 
     def _get_agent(self):
         """Get the shared agent singleton for state persistence."""
@@ -73,10 +94,12 @@ class RAGChainAdapter:
             RAGResponse with answer and metadata
         """
         agent = self._get_agent()
+        user_timezone = self._get_user_timezone()
 
         result = await agent.invoke(
             query=query,
             user_id=self.user_id,
+            user_timezone=user_timezone,
             document_ids=self.document_ids,
             thread_id=self.thread_id,  # Pass thread_id for state persistence
         )
@@ -117,10 +140,12 @@ class RAGChainAdapter:
 
             try:
                 agent = self._get_agent()
+                user_timezone = self._get_user_timezone()
                 result = loop.run_until_complete(
                     agent.invoke(
                         query=query,
                         user_id=self.user_id,
+                        user_timezone=user_timezone,
                         document_ids=self.document_ids,
                         thread_id=self.thread_id,  # Pass thread_id for state persistence
                     )

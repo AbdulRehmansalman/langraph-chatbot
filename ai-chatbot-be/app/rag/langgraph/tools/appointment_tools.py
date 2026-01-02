@@ -20,12 +20,68 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 try:
+    import pytz
+    PYTZ_AVAILABLE = True
+except ImportError:
+    PYTZ_AVAILABLE = False
+
+try:
     import dateparser
     DATEPARSER_AVAILABLE = True
 except ImportError:
     DATEPARSER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _get_timezone(tz_str: str) -> Any:
+    """Get a timezone object from timezone string."""
+    if PYTZ_AVAILABLE:
+        try:
+            return pytz.timezone(tz_str)
+        except Exception:
+            return pytz.UTC
+    return None
+
+
+def _localize_datetime(dt: datetime, tz_str: str) -> datetime:
+    """
+    Localize a naive datetime to the specified timezone.
+
+    Args:
+        dt: Naive datetime object
+        tz_str: Timezone string (e.g., "Asia/Karachi", "America/New_York")
+
+    Returns:
+        Timezone-aware datetime in the specified timezone
+    """
+    if PYTZ_AVAILABLE:
+        try:
+            tz = pytz.timezone(tz_str)
+            # If datetime is naive, localize it (don't convert, just set the timezone)
+            if dt.tzinfo is None:
+                return tz.localize(dt)
+            else:
+                # If already has timezone, convert to the target timezone
+                return dt.astimezone(tz)
+        except Exception as e:
+            logger.warning(f"Failed to localize datetime to {tz_str}: {e}")
+            return dt
+    else:
+        # Without pytz, return as-is but log warning
+        logger.warning("pytz not available - timezone localization disabled")
+        return dt
+
+
+def _get_current_time_in_timezone(tz_str: str) -> datetime:
+    """Get current time in the specified timezone."""
+    if PYTZ_AVAILABLE:
+        try:
+            tz = pytz.timezone(tz_str)
+            return datetime.now(tz)
+        except Exception:
+            pass
+    return datetime.now()
 
 
 # =============================================================================
@@ -84,16 +140,40 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
     - "Schedule CBC tomorrow at 3pm" (extracts datetime portion)
 
     Returns:
-        dict with keys: datetime, confidence, ambiguous, timezone
+        dict with keys: datetime (timezone-aware), confidence, ambiguous, timezone
     """
     text_lower = text.lower()
+<<<<<<< Updated upstream
+=======
+    # Get current time in user's timezone for relative date calculations
+    now = _get_current_time_in_timezone(timezone)
+
+    logger.info(f"Parsing datetime from '{text}' in timezone {timezone}, now={now.isoformat()}")
+
+    # First try our custom parser for common patterns (more reliable)
+    # This ensures "tomorrow" always means the next day in user's timezone
+    custom_parsed = _parse_common_datetime_patterns(text_lower, now, timezone)
+    if custom_parsed:
+        logger.info(f"Custom parser result: {custom_parsed.isoformat()} for '{text}'")
+        ambiguous = any(w in text_lower for w in ['afternoon', 'morning', 'evening'])
+        return {
+            "datetime": custom_parsed,
+            "confidence": 0.95,
+            "ambiguous": ambiguous,
+            "timezone": timezone,
+        }
+>>>>>>> Stashed changes
 
     if DATEPARSER_AVAILABLE:
         settings = {
             'TIMEZONE': timezone,
             'RETURN_AS_TIMEZONE_AWARE': True,
             'PREFER_DATES_FROM': 'future',
+<<<<<<< Updated upstream
             'RELATIVE_BASE': datetime.now(),  # Use current time as base
+=======
+            'RELATIVE_BASE': now.replace(tzinfo=None) if now.tzinfo else now,  # dateparser expects naive datetime
+>>>>>>> Stashed changes
         }
 
         # First try the full text
@@ -142,6 +222,87 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
             return {"datetime": None, "confidence": 0, "ambiguous": True, "timezone": timezone}
 
 
+<<<<<<< Updated upstream
+=======
+def _parse_common_datetime_patterns(text: str, now: datetime, timezone: str = "UTC") -> datetime | None:
+    """
+    Parse common datetime patterns with high reliability.
+
+    Handles:
+    - "tomorrow at 4pm" -> next day at 16:00 in user's timezone
+    - "today at 3pm" -> same day at 15:00 in user's timezone
+    - "next monday at 10am" -> next Monday at 10:00 in user's timezone
+
+    Args:
+        text: The text to parse
+        now: Current time (should be timezone-aware in user's timezone)
+        timezone: User's timezone string (e.g., "Asia/Karachi")
+
+    Returns:
+        Timezone-aware datetime in user's timezone, or None if parsing fails
+    """
+    text_lower = text.lower()
+
+    # Extract time first
+    time_match = re.search(r'(\d{1,2}):?(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?', text_lower)
+    hour = 9  # Default to 9 AM
+    minute = 0
+
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2)) if time_match.group(2) else 0
+        ampm = time_match.group(3)
+
+        if ampm:
+            ampm = ampm.replace('.', '').lower()
+            if ampm == 'pm' and hour != 12:
+                hour += 12
+            elif ampm == 'am' and hour == 12:
+                hour = 0
+
+    # Determine the date (using naive datetime for date calculation)
+    # We'll localize at the end
+    now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+    target_date = None
+
+    if 'tomorrow' in text_lower:
+        target_date = now_naive + timedelta(days=1)
+    elif 'today' in text_lower or 'tonight' in text_lower:
+        target_date = now_naive
+        if 'tonight' in text_lower and hour < 17:
+            hour = 19  # Default evening time
+    elif 'next week' in text_lower:
+        target_date = now_naive + timedelta(weeks=1)
+    else:
+        # Check for day of week
+        days_of_week = {
+            'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+            'friday': 4, 'saturday': 5, 'sunday': 6
+        }
+        for day_name, day_num in days_of_week.items():
+            if day_name in text_lower:
+                current_day = now_naive.weekday()
+                days_ahead = day_num - current_day
+
+                # "next monday" always means the next occurrence
+                if 'next' in text_lower or days_ahead <= 0:
+                    days_ahead += 7
+
+                target_date = now_naive + timedelta(days=days_ahead)
+                break
+
+    if target_date:
+        # Create the datetime with the specified time
+        result = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # Localize to user's timezone
+        localized = _localize_datetime(result, timezone)
+        logger.info(f"Parsed '{text}' -> {localized.isoformat()} (timezone: {timezone})")
+        return localized
+
+    return None
+
+
+>>>>>>> Stashed changes
 def extract_duration(text: str) -> int:
     """
     Extract meeting duration from natural language. Default: 30 minutes.
@@ -324,6 +485,7 @@ class ScheduleMeetingInput(BaseModel):
     description: Optional[str] = Field(default=None, description="Meeting description")
     location: Optional[str] = Field(default=None, description="Meeting location or video link")
     user_id: Optional[str] = Field(default=None, description="User ID")
+    timezone: Optional[str] = Field(default="UTC", description="User's timezone (e.g., 'Asia/Karachi')")
 
 
 class RescheduleMeetingInput(BaseModel):
@@ -579,6 +741,7 @@ async def schedule_meeting(
     description: Optional[str] = None,
     location: Optional[str] = None,
     user_id: Optional[str] = None,
+    timezone: Optional[str] = "UTC",
 ) -> dict[str, Any]:
     """
     Schedule a new meeting.
@@ -593,16 +756,32 @@ async def schedule_meeting(
         description: Meeting description
         location: Meeting location
         user_id: User ID
+<<<<<<< Updated upstream
         
+=======
+        timezone: User's timezone (e.g., 'Asia/Karachi')
+
+>>>>>>> Stashed changes
     Returns:
         Meeting creation result
     """
+<<<<<<< Updated upstream
     logger.info(f"Scheduling meeting: {title} at {datetime_str}")
     
+=======
+    tz = timezone or "UTC"
+    logger.info(f"SCHEDULE_MEETING: Creating '{title}' at {datetime_str} for user {user_id} (timezone: {tz})")
+
+>>>>>>> Stashed changes
     try:
-        # Parse the datetime
-        start_time = parse_natural_datetime(datetime_str)
+        # Parse the datetime with timezone awareness
+        parsed = parse_natural_datetime_enhanced(datetime_str, tz)
+        if not parsed.get("datetime"):
+            start_time = parse_natural_datetime(datetime_str, tz)
+        else:
+            start_time = parsed["datetime"]
         end_time = start_time + timedelta(minutes=duration_minutes)
+<<<<<<< Updated upstream
         
         # Check for conflicts
         conflicts = await _check_conflicts(user_id, start_time, end_time)
@@ -623,16 +802,120 @@ async def schedule_meeting(
             }
         
         # Create the meeting
+=======
+
+        logger.info(f"SCHEDULE_MEETING: Parsed time - start={start_time.isoformat()}, end={end_time.isoformat()}, tz={tz}")
+
+        # Try to create event on Google Calendar first
+        google_success = False
+        google_result = None
+
+        if user_id:
+            try:
+                from app.services.calendar import get_calendar_service, CalendarEvent
+
+                # Get the user's Google Calendar service (may return None)
+                calendar_service = await get_calendar_service(user_id)
+
+                if calendar_service:
+                    # Create calendar event object with timezone
+                    calendar_event = CalendarEvent(
+                        title=title,
+                        description=description or f"Scheduled via DocScheduler AI",
+                        start_time=start_time,
+                        end_time=end_time,
+                        location=location,
+                        attendees=participants,
+                        timezone=tz,
+                    )
+
+                    # Create event on Google Calendar
+                    google_result = await calendar_service.create_event(
+                        event=calendar_event,
+                        send_notifications=True,
+                        add_google_meet=False,  # Don't add Meet for medical appointments
+                    )
+
+                    logger.info(f"SCHEDULE_MEETING: Google Calendar result = {google_result}")
+
+                    if google_result.get("success"):
+                        google_success = True
+                        google_event_id = google_result.get("event_id")
+
+                        # Also save to database for record keeping
+                        try:
+                            from app.services.supabase_client import supabase_client
+                            import uuid
+
+                            meeting_data = {
+                                "id": str(uuid.uuid4()),
+                                "user_id": user_id,
+                                "title": title,
+                                "description": description or f"Scheduled via DocScheduler AI",
+                                "scheduled_time": start_time.isoformat(),
+                                "duration_minutes": duration_minutes,
+                                "meeting_link": google_result.get("calendar_link"),
+                                "attendees": participants or [],
+                                "status": "confirmed",
+                                "google_event_id": google_event_id,
+                            }
+
+                            db_result = supabase_client.table("meetings").insert(meeting_data).execute()
+                            if db_result.data:
+                                logger.info(f"SCHEDULE_MEETING: ✅ Saved to meetings table: {db_result.data[0].get('id')}")
+                            else:
+                                logger.warning("SCHEDULE_MEETING: Failed to save to meetings table")
+                        except Exception as db_err:
+                            logger.warning(f"SCHEDULE_MEETING: DB save error (non-fatal): {db_err}")
+
+                        # Successfully created on Google Calendar
+                        return {
+                            "success": True,
+                            "meeting_id": google_event_id,
+                            "title": title,
+                            "start_time": start_time.isoformat(),
+                            "end_time": end_time.isoformat(),
+                            "duration_minutes": duration_minutes,
+                            "participants": participants or [],
+                            "location": location,
+                            "status": "confirmed",
+                            "calendar_link": google_result.get("calendar_link"),
+                            "google_meet_link": google_result.get("google_meet_link"),
+                            "message": f"✅ '{title}' scheduled for {start_time.strftime('%A, %B %d at %I:%M %p')}",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "source": "google_calendar",
+                        }
+                    else:
+                        logger.warning(f"SCHEDULE_MEETING: Google Calendar failed: {google_result.get('error')}")
+                else:
+                    logger.info("SCHEDULE_MEETING: Google Calendar not configured, using database")
+
+            except Exception as gcal_error:
+                logger.warning(f"SCHEDULE_MEETING: Google Calendar error: {gcal_error}")
+                # Continue to Supabase fallback
+        else:
+            logger.warning("SCHEDULE_MEETING: No user_id provided, skipping Google Calendar")
+
+        # Fallback: Save to database if Google Calendar fails or unavailable
+        logger.info("SCHEDULE_MEETING: Saving to meetings table")
+
+>>>>>>> Stashed changes
         import uuid
         meeting_id = str(uuid.uuid4())
         
         try:
             from app.services.supabase_client import supabase_client
+<<<<<<< Updated upstream
             
+=======
+
+            # Use correct field names matching the meetings table schema
+>>>>>>> Stashed changes
             meeting_data = {
                 "id": meeting_id,
                 "user_id": user_id,
                 "title": title,
+<<<<<<< Updated upstream
                 "start_time": start_time.isoformat(),
                 "end_time": end_time.isoformat(),
                 "duration_minutes": duration_minutes,
@@ -645,6 +928,40 @@ async def schedule_meeting(
             result = supabase_client.table("calendar_events").insert(meeting_data).execute()
 
             if not result.data:
+=======
+                "description": description or f"Scheduled via DocScheduler AI",
+                "scheduled_time": start_time.isoformat(),
+                "duration_minutes": duration_minutes,
+                "meeting_link": location,  # Use location as meeting link if provided
+                "attendees": participants or [],
+                "status": "scheduled",
+                "google_event_id": None,  # No Google event since Calendar not available
+            }
+
+            logger.info(f"SCHEDULE_MEETING: Inserting to meetings table: {meeting_data}")
+            result = supabase_client.table("meetings").insert(meeting_data).execute()
+
+            if result.data:
+                logger.info(f"SCHEDULE_MEETING: ✅ Successfully saved to meetings: {result.data}")
+                # Success - meeting saved to database
+                return {
+                    "success": True,
+                    "meeting_id": meeting_id,
+                    "title": title,
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "duration_minutes": duration_minutes,
+                    "participants": participants or [],
+                    "location": location,
+                    "status": "scheduled",
+                    "message": f"✅ '{title}' scheduled for {start_time.strftime('%A, %B %d at %I:%M %p')}",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "source": "database",
+                    "note": "Saved to local calendar. Connect Google Calendar for sync.",
+                }
+            else:
+                logger.warning(f"SCHEDULE_MEETING: Insert returned no data")
+>>>>>>> Stashed changes
                 raise Exception("Insert returned no data")
 
             # Success - meeting saved to database
