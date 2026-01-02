@@ -143,8 +143,6 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
         dict with keys: datetime (timezone-aware), confidence, ambiguous, timezone
     """
     text_lower = text.lower()
-<<<<<<< Updated upstream
-=======
     # Get current time in user's timezone for relative date calculations
     now = _get_current_time_in_timezone(timezone)
 
@@ -162,18 +160,13 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
             "ambiguous": ambiguous,
             "timezone": timezone,
         }
->>>>>>> Stashed changes
 
     if DATEPARSER_AVAILABLE:
         settings = {
             'TIMEZONE': timezone,
             'RETURN_AS_TIMEZONE_AWARE': True,
             'PREFER_DATES_FROM': 'future',
-<<<<<<< Updated upstream
-            'RELATIVE_BASE': datetime.now(),  # Use current time as base
-=======
             'RELATIVE_BASE': now.replace(tzinfo=None) if now.tzinfo else now,  # dateparser expects naive datetime
->>>>>>> Stashed changes
         }
 
         # First try the full text
@@ -222,8 +215,6 @@ def parse_natural_datetime_enhanced(text: str, timezone: str = "UTC") -> dict:
             return {"datetime": None, "confidence": 0, "ambiguous": True, "timezone": timezone}
 
 
-<<<<<<< Updated upstream
-=======
 def _parse_common_datetime_patterns(text: str, now: datetime, timezone: str = "UTC") -> datetime | None:
     """
     Parse common datetime patterns with high reliability.
@@ -302,7 +293,6 @@ def _parse_common_datetime_patterns(text: str, now: datetime, timezone: str = "U
     return None
 
 
->>>>>>> Stashed changes
 def extract_duration(text: str) -> int:
     """
     Extract meeting duration from natural language. Default: 30 minutes.
@@ -756,23 +746,14 @@ async def schedule_meeting(
         description: Meeting description
         location: Meeting location
         user_id: User ID
-<<<<<<< Updated upstream
-        
-=======
         timezone: User's timezone (e.g., 'Asia/Karachi')
 
->>>>>>> Stashed changes
     Returns:
         Meeting creation result
     """
-<<<<<<< Updated upstream
-    logger.info(f"Scheduling meeting: {title} at {datetime_str}")
-    
-=======
     tz = timezone or "UTC"
     logger.info(f"SCHEDULE_MEETING: Creating '{title}' at {datetime_str} for user {user_id} (timezone: {tz})")
 
->>>>>>> Stashed changes
     try:
         # Parse the datetime with timezone awareness
         parsed = parse_natural_datetime_enhanced(datetime_str, tz)
@@ -781,28 +762,6 @@ async def schedule_meeting(
         else:
             start_time = parsed["datetime"]
         end_time = start_time + timedelta(minutes=duration_minutes)
-<<<<<<< Updated upstream
-        
-        # Check for conflicts
-        conflicts = await _check_conflicts(user_id, start_time, end_time)
-        
-        if conflicts:
-            # Find alternative slots
-            alternatives = await _find_alternative_slots(
-                user_id, start_time.date(), duration_minutes
-            )
-            
-            return {
-                "success": False,
-                "error": "Scheduling conflict detected",
-                "conflicts": conflicts,
-                "alternative_slots": alternatives,
-                "message": f"There's already a meeting at this time: {conflicts[0].get('title')}",
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-        
-        # Create the meeting
-=======
 
         logger.info(f"SCHEDULE_MEETING: Parsed time - start={start_time.isoformat()}, end={end_time.isoformat()}, tz={tz}")
 
@@ -899,36 +858,17 @@ async def schedule_meeting(
         # Fallback: Save to database if Google Calendar fails or unavailable
         logger.info("SCHEDULE_MEETING: Saving to meetings table")
 
->>>>>>> Stashed changes
         import uuid
         meeting_id = str(uuid.uuid4())
         
         try:
             from app.services.supabase_client import supabase_client
-<<<<<<< Updated upstream
-            
-=======
 
             # Use correct field names matching the meetings table schema
->>>>>>> Stashed changes
             meeting_data = {
                 "id": meeting_id,
                 "user_id": user_id,
                 "title": title,
-<<<<<<< Updated upstream
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "duration_minutes": duration_minutes,
-                "participants": participants or [],
-                "description": description,
-                "location": location,
-                "status": "confirmed",
-            }
-            
-            result = supabase_client.table("calendar_events").insert(meeting_data).execute()
-
-            if not result.data:
-=======
                 "description": description or f"Scheduled via DocScheduler AI",
                 "scheduled_time": start_time.isoformat(),
                 "duration_minutes": duration_minutes,
@@ -961,7 +901,6 @@ async def schedule_meeting(
                 }
             else:
                 logger.warning(f"SCHEDULE_MEETING: Insert returned no data")
->>>>>>> Stashed changes
                 raise Exception("Insert returned no data")
 
             # Success - meeting saved to database
