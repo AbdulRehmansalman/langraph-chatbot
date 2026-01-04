@@ -63,7 +63,7 @@ agent:
   self_correction:
     enabled: true
     max_retries: 2
-    confidence_threshold: 0.5
+    confidence_threshold: 0.7
     hallucination_threshold: 0.3
 
   # Rate limiting for LLM calls
@@ -217,13 +217,13 @@ retrieval:
   # Vector store settings
   vector_store:
     type: "pgvector"
-    embedding_dimension: 768
+    embedding_dimension: 1024
     index_type: "ivfflat"  # ivfflat, hnsw
 
   # Embedding model
   embeddings:
     provider: "huggingface"
-    model: "sentence-transformers/all-mpnet-base-v2"
+    model: "BAAI/bge-large-en-v1.5"
     batch_size: 100
 
   # Reranking configuration
@@ -265,7 +265,7 @@ error_handling:
   timeouts:
     default_seconds: 30
     llm_seconds: 120
-    tool_seconds: 60
+    tool_seconds: 300
 
 # -----------------------------------------------------------------------------
 # Observability Configuration

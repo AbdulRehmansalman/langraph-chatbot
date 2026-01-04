@@ -8,7 +8,7 @@ Provides backward compatibility for existing endpoints.
 
 import asyncio
 import logging
-from typing import Any, Iterator, Optional
+from typing import Any, AsyncIterator, Iterator, Optional
 
 from app.services.llm_factory import llm_factory
 
@@ -115,12 +115,13 @@ class RAGChainAdapter:
             citations=result.get("citations", []),
         )
 
-    def stream(self, query: str) -> Iterator[str]:
+    async def stream(self, query: str) -> AsyncIterator[str]:
         """
         Stream response tokens.
 
         NOTE: This method now uses the same retrieval path as invoke() to ensure
-        retrieval is ALWAYS executed. The sync wrapper runs the async agent.
+        retrieval is ALWAYS executed. The async implementation runs the agent 
+        and then yields chunks.
 
         Args:
             query: User's query
@@ -128,43 +129,33 @@ class RAGChainAdapter:
         Yields:
             Response tokens
         """
-        import asyncio
-
         logger.info(f"STREAM: Starting streaming for query: {query[:50]}...")
 
         try:
-            # Run the full agent to ensure retrieval executes
-            # This guarantees retrieval is not bypassed
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            agent = self._get_agent()
+            user_timezone = self._get_user_timezone()
+            
+            # Run the agent in the current event loop
+            result = await agent.invoke(
+                query=query,
+                user_id=self.user_id,
+                user_timezone=user_timezone,
+                document_ids=self.document_ids,
+                thread_id=self.thread_id,  # Pass thread_id for state persistence
+            )
 
-            try:
-                agent = self._get_agent()
-                user_timezone = self._get_user_timezone()
-                result = loop.run_until_complete(
-                    agent.invoke(
-                        query=query,
-                        user_id=self.user_id,
-                        user_timezone=user_timezone,
-                        document_ids=self.document_ids,
-                        thread_id=self.thread_id,  # Pass thread_id for state persistence
-                    )
-                )
+            # Get the full response from agent
+            response = result.get("response", "")
+            documents = result.get("documents", [])
 
-                # Get the full response from agent
-                response = result.get("response", "")
-                documents = result.get("documents", [])
+            logger.info(f"STREAM: Agent returned {len(documents)} documents")
 
-                logger.info(f"STREAM: Agent returned {len(documents)} documents")
-
-                # Yield response in chunks to simulate streaming
-                # This maintains streaming UX while ensuring retrieval runs
-                chunk_size = 20
-                for i in range(0, len(response), chunk_size):
-                    yield response[i:i + chunk_size]
-
-            finally:
-                loop.close()
+            # Yield response in chunks to simulate streaming
+            # This maintains streaming UX while ensuring retrieval runs
+            chunk_size = 20
+            for i in range(0, len(response), chunk_size):
+                yield response[i:i + chunk_size]
+                await asyncio.sleep(0)  # Yield control to the event loop
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")

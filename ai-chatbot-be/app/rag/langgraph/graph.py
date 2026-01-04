@@ -217,6 +217,9 @@ async def retrieve_service_from_documents(
             limit=top_k
         )
 
+        # DEBUG: Log what we're searching for
+        logger.debug(f"🔍 DEBUG: Looking for service in query '{query}'")
+
         if not results:
             logger.info(f"SERVICE_RETRIEVAL: No documents found for '{query}'")
             return {
@@ -226,6 +229,14 @@ async def retrieve_service_from_documents(
                 "documents": [],
                 "similar_services": [],
             }
+
+        # Add logging for the search results (INFO level for visibility)
+        for i, doc in enumerate(results):
+            wording = doc.get('content', '')[:200].replace('\n', ' ')
+            logger.info(f"🔍 RETRIEVAL RESULT {i+1}:")
+            logger.info(f"    - Wording: {wording}...")
+            logger.info(f"    - Score: {doc.get('score', 'N/A')}")
+            logger.info(f"    - Source: {doc.get('metadata', {}).get('source', 'Unknown')}")
 
         # Check if service name appears in any result (exact/partial match)
         service_lower = service_name.lower()
@@ -773,6 +784,7 @@ async def execute_scheduling_node(state: AgentState) -> dict:
     updates = track_node(state, "execute_scheduling")
     user_id = state.get("user_id")
     thread_id = state.get("thread_id")
+    user_timezone = state.get("user_timezone", "UTC")
 
     logger.info(f"EXECUTE_SCHEDULING: Starting for user {user_id}, thread {thread_id}")
 
@@ -796,6 +808,7 @@ async def execute_scheduling_node(state: AgentState) -> dict:
             "duration_minutes": pending.get("duration", 60),
             "participants": pending.get("attendees"),
             "user_id": user_id or pending.get("user_id"),
+            "timezone": user_timezone,
         })
 
         logger.info(f"EXECUTE_SCHEDULING: Result = {result}")

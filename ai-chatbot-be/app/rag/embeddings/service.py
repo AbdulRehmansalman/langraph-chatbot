@@ -55,13 +55,16 @@ class EmbeddingsService:
     # Embedding model configurations
     MODELS = {
         "huggingface": {
-            "default": "sentence-transformers/all-mpnet-base-v2",
-            "production": "sentence-transformers/all-mpnet-base-v2",
+            "default": "BAAI/bge-large-en-v1.5",
+            "production": "BAAI/bge-large-en-v1.5",
             "multilingual": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             "dimensions": {
                 "all-MiniLM-L6-v2": 384,
                 "sentence-transformers/all-mpnet-base-v2": 768,
                 "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
+                "BAAI/bge-large-en-v1.5": 1024,
+                "BAAI/bge-base-en-v1.5": 768,
+                "BAAI/bge-small-en-v1.5": 384,
             },
         },
         "openai": {
