@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
-    embedding VECTOR(768),
+    embedding VECTOR(1024),
     metadata JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -171,7 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_meetings_scheduled_time ON meetings(scheduled_tim
 
 -- Vector similarity search function
 CREATE OR REPLACE FUNCTION match_documents(
-    query_embedding VECTOR(768),
+    query_embedding VECTOR(1024),
     match_threshold FLOAT DEFAULT 0.5,
     match_count INT DEFAULT 10
 )
@@ -202,7 +202,7 @@ $$;
 
 -- User-scoped document search
 CREATE OR REPLACE FUNCTION match_user_documents(
-    query_embedding VECTOR(768),
+    query_embedding VECTOR(1024),
     user_id_param UUID,
     match_threshold FLOAT DEFAULT 0.5,
     match_count INT DEFAULT 10
@@ -233,3 +233,6 @@ BEGIN
     LIMIT match_count;
 END;
 $$;
+
+
+

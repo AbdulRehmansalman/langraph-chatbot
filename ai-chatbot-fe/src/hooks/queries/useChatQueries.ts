@@ -18,21 +18,6 @@ export const useChatHistory = (limit: number = 50) => {
 };
 
 // Mutations
-export const useSendMessage = () => {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (message: ChatMessage) => chatAPI.sendMessage(message),
-    onSuccess: () => {
-      // Invalidate and refetch chat history
-      queryClient.invalidateQueries({ queryKey: chatKeys.all });
-    },
-    onError: error => {
-      console.error('Send message failed:', error);
-    },
-  });
-};
-
 export const useDeleteMessage = () => {
   const queryClient = useQueryClient();
 

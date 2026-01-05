@@ -725,9 +725,9 @@ async def schedule_meeting(
 
     try:
         # Parse the datetime with timezone awareness
-        parsed = parse_natural_datetime_enhanced(datetime_str, tz)
+        parsed = parse_natural_datetime_enhanced(datetime_str, timezone)
         if not parsed.get("datetime"):
-            start_time = parse_natural_datetime(datetime_str, tz)
+            start_time = parse_natural_datetime(datetime_str, timezone)
         else:
             start_time = parsed["datetime"]
         end_time = start_time + timedelta(minutes=duration_minutes)

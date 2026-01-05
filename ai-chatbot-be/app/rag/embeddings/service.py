@@ -7,8 +7,10 @@ Production embeddings with caching and multiple provider support.
 import os
 import logging
 import hashlib
+import json
 from typing import List, Optional, Dict, Any
 from functools import lru_cache
+from pathlib import Path
 import numpy as np
 
 from langchain_core.documents import Document
@@ -55,13 +57,16 @@ class EmbeddingsService:
     # Embedding model configurations
     MODELS = {
         "huggingface": {
-            "default": "sentence-transformers/all-mpnet-base-v2",
-            "production": "sentence-transformers/all-mpnet-base-v2",
+            "default": "BAAI/bge-large-en-v1.5",
+            "production": "BAAI/bge-large-en-v1.5",
             "multilingual": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             "dimensions": {
                 "all-MiniLM-L6-v2": 384,
                 "sentence-transformers/all-mpnet-base-v2": 768,
                 "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
+                "BAAI/bge-large-en-v1.5": 1024,
+                "BAAI/bge-base-en-v1.5": 768,
+                "BAAI/bge-small-en-v1.5": 384,
             },
         },
         "openai": {
@@ -113,6 +118,10 @@ class EmbeddingsService:
         self._cache: Dict[str, List[float]] = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        
+        # Persistent cache file
+        self._cache_file = Path("embeddings_cache.json")
+        self._load_cache()
 
         logger.info(
             f"EmbeddingsService initialized: provider={provider}, model={self.model_name}, dimensions={self.dimensions}"
@@ -213,6 +222,9 @@ class EmbeddingsService:
         # Cache result
         if self.use_cache:
             self._cache[cache_key] = embedding
+            # Save every 50 new items or so roughly (simple heuristic to avoid too much IO)
+            if len(self._cache) % 50 == 0:
+                self._save_cache()
 
         return embedding
 
@@ -376,7 +388,28 @@ class EmbeddingsService:
         self._cache.clear()
         self._cache_hits = 0
         self._cache_misses = 0
+        # save empty cache
+        self._save_cache()
         logger.info("Embedding cache cleared")
+
+    def _load_cache(self):
+        """Load cache from disk."""
+        if self._cache_file.exists():
+            try:
+                with open(self._cache_file, "r") as f:
+                    self._cache = json.load(f)
+                logger.info(f"Loaded {len(self._cache)} cached embeddings from disk")
+            except Exception as e:
+                logger.warning(f"Failed to load embedding cache: {e}")
+
+    def _save_cache(self):
+        """Save cache to disk."""
+        try:
+            with open(self._cache_file, "w") as f:
+                json.dump(self._cache, f)
+        except Exception as e:
+            logger.warning(f"Failed to save embedding cache: {e}")
+
 
 
 # Create instances for different use cases

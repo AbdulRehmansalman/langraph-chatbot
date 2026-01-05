@@ -4,7 +4,7 @@ Text Processing Utilities
 Shared text processing utilities for the RAG pipeline.
 
 This module centralizes text processing logic to eliminate duplication
-across rag_chain.py, vector_store.py, and retriever.py.
+across vector_store.py, and retriever.py.
 """
 
 from typing import List, Set

@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 RETRIEVAL_TIMEOUT = 10.0  # seconds
-VECTOR_FETCH_COUNT = 15   # Candidates from vector search
-KEYWORD_FETCH_COUNT = 15  # Candidates from keyword search
+VECTOR_FETCH_COUNT = 5   # Candidates from vector search
+KEYWORD_FETCH_COUNT = 5  # Candidates from keyword search
 FINAL_RETURN_COUNT = 5    # Results after reranking
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.1"))
 RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
@@ -429,9 +429,10 @@ async def _vector_search(
                     if document_ids and str(doc_id) not in document_ids:
                         continue
 
-                    # Log similarity scores for debugging
+                    # Log results with wording (INFO level for visibility)
                     if rank < 3:
-                        logger.info(f"  Vector result {rank+1}: similarity={similarity:.4f}")
+                        wording = content[:150].replace("\n", " ") if content else "Empty"
+                        logger.info(f"  Vector result {rank+1}: similarity={similarity:.4f} | Wording: {wording}...")
 
                     # RELAXED: Only filter very low similarity (< 0.01)
                     # Let the reranker handle quality filtering
@@ -885,14 +886,15 @@ async def document_retrieval_node(state: AgentState) -> dict[str, Any]:
             documents = await _rerank_documents(query, documents)
             logger.info(f"Returning top {len(documents)} documents after reranking")
 
-            # Log top results for debugging
+            # Log top results with wording for debugging (INFO level for visibility)
             for i, doc in enumerate(documents[:3]):
                 found_by = doc.get("found_by", ["unknown"])
+                content_preview = doc.get("content", "")[:250].replace("\n", " ")
                 logger.info(
-                    f"Result {i+1}: score={doc.get('score', 0):.4f}, "
-                    f"found_by={found_by}, "
+                    f"🔍 CHUNK {i+1} [{found_by}]: score={doc.get('score', 0):.4f}, "
                     f"source={doc.get('source', 'unknown')}"
                 )
+                logger.info(f"    - Wording: {content_preview}...")
         else:
             logger.warning(
                 f"No documents found for query: {query[:50]}... "

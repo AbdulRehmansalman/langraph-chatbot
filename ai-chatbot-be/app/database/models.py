@@ -113,7 +113,7 @@ class DocumentChunk(Base):
     )
     chunk_index = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
-    embedding = Column(Vector(768))
+    embedding = Column(Vector(1024))
     # 'metadata' is reserved in SQLAlchemy, so we use 'chunk_metadata' as the Python attribute
     # but map it to the 'metadata' column in the database
     chunk_metadata = Column("metadata", JSONB, default={})

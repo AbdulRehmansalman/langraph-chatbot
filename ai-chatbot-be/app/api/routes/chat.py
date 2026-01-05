@@ -1,109 +1,191 @@
 """
 Chat API Routes
 ===============
-Production-ready chat endpoints with enterprise validation and guardrails.
-
-Enterprise Features:
-- Strong Pydantic validation at API boundary
-- Prompt injection detection
-- Input sanitization before RAG
-- Request size limits
-- Clear error messages
+Production-ready chat endpoints with real-time streaming.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+import asyncio
 import time
 import logging
+from typing import Set
 
-from app.models.schemas import ChatMessage, ChatResponse, ChatHistory
+from app.models.schemas import ChatHistory, StreamingChatRequest
 from app.api.dependencies.auth import get_current_user_id
 from app.core.exceptions import ValidationException
-from app.services.supabase_client import supabase_client
 from app.validation.input import validate_and_sanitize
 from app.repositories import chat_history_repository
-from app.rag.chain import create_rag_chain, get_llm_provider, RAGResponse
-
+from app.rag.langgraph import create_agent
+from app.services.llm_factory import llm_factory
+from app.streaming.sse import (
+    StreamingManager,
+    StreamEventType,
+    StatusEvent,
+    StreamStatus,
+    CompleteEvent,
+    ErrorEvent,
+    create_error_stream
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Shared agent singleton
+_agent = None
 
-@router.post("/message", response_model=ChatResponse)
-async def send_message(
-    message: ChatMessage,
+
+def _get_agent():
+    """Get or create shared agent."""
+    global _agent
+    if _agent is None:
+        _agent = create_agent()
+        logger.info("Created shared agent")
+    return _agent
+
+
+def _get_user_timezone(user_id: str) -> str:
+    """Fetch user timezone from database."""
+    try:
+        from app.services.supabase_client import supabase_client
+        result = supabase_client.table("users").select("timezone").eq("id", user_id).execute()
+        if result.data and result.data[0].get("timezone"):
+            return result.data[0]["timezone"]
+    except Exception as e:
+        logger.warning(f"Failed to fetch timezone: {e}")
+    return "UTC"
+
+
+# Background task tracking
+_background_tasks: Set[asyncio.Task] = set()
+_MAX_BACKGROUND_TASKS = 1000
+
+def _track_background_task(task: asyncio.Task) -> None:
+    """Track background task and clean up when done."""
+    if len(_background_tasks) > _MAX_BACKGROUND_TASKS:
+        _background_tasks.difference_update({t for t in _background_tasks if t.done()})
+    _background_tasks.add(task)
+    task.add_done_callback(lambda t: _background_tasks.discard(t))
+
+
+@router.post("/stream")
+async def stream_chat_response(
+    message: StreamingChatRequest,
     user_id: str = Depends(get_current_user_id)
 ):
-    """
-    Send a chat message and get a response.
-
-    Enterprise Guardrails:
-    - Pydantic validation (1-10000 chars, max 50 document IDs)
-    - Prompt injection detection (15+ patterns)
-    - Input sanitization (control chars, zero-width chars)
-    - Token count validation (max 2000 tokens)
-    """
-    start_time = time.time()
-
+    """Stream chat response using SSE with real-time LLM streaming."""
     try:
-        # GUARDRAIL: Validate and sanitize input
         sanitized_message, validated_doc_ids = validate_and_sanitize(
             message.message,
             message.document_ids
         )
-
-        logger.info(
-            f"Chat request - User: {user_id}, "
-            f"Message length: {len(sanitized_message)}, "
-            f"Documents: {len(validated_doc_ids) if validated_doc_ids else 0}"
-        )
-
-        # Create RAG chain with thread_id for conversation continuity
-        rag_chain = create_rag_chain(
-            user_id=user_id,
-            document_ids=validated_doc_ids,
-            thread_id=message.thread_id,  # Required for multi-turn scheduling
-        )
-
-        # Generate response
-        rag_response: RAGResponse = await rag_chain.invoke(sanitized_message)
-        response = rag_response.answer
-        response_time = round(time.time() - start_time, 3)
-
-        # Save chat history using repository pattern
-        # Only include fields that exist in the ChatHistory model
-        chat_data = {
-            "user_id": user_id,
-            "user_message": sanitized_message,
-            "bot_response": response,
-            "document_ids": validated_doc_ids if validated_doc_ids else [],
-            "response_time": response_time,
-            "has_documents": bool(validated_doc_ids),
-            "sources_used": len(validated_doc_ids) if validated_doc_ids else 0,
-            "provider": get_llm_provider(),
-        }
-
-        # Use repository instead of direct database access
-        saved_chat = await chat_history_repository.create(chat_data)
-
-        return ChatResponse(
-            id=saved_chat["id"],
-            user_message=sanitized_message,
-            bot_response=response,
-            document_ids=validated_doc_ids,
-            created_at=saved_chat["created_at"]
-        )
-
     except ValidationException as e:
-        # Return validation errors with 400 status
-        logger.warning(f"Validation error for user {user_id}: {e.message}")
-        raise HTTPException(status_code=400, detail=e.message)
+        return StreamingResponse(
+            iter([create_error_stream(e.message, "VALIDATION_ERROR")]),
+            media_type="text/event-stream"
+        )
 
-    except HTTPException:
-        raise
+    logger.info(f"Stream request - User: {user_id}, Message: {sanitized_message[:50]}...")
 
+    async def event_generator():
+        start_time = time.time()
+        full_response = ""
+        stream_completed = False
+
+        try:
+            logger.info("STREAM: Starting event generator")
+            yield StatusEvent(data={"status": StreamStatus.STARTING, "message": "Initializing..."}).to_sse()
+            await asyncio.sleep(0)  # Force flush
+
+            agent = _get_agent()
+            user_timezone = _get_user_timezone(user_id)
+
+            logger.info("STREAM: Agent retrieved")
+            yield StatusEvent(data={"status": StreamStatus.GENERATING, "message": "Generating..."}).to_sse()
+            await asyncio.sleep(0)  # Force flush
+# manages how tokens are streamed
+            streaming_manager = StreamingManager(
+                timeout=float(message.stream_timeout),
+                heartbeat_interval=2.0,
+                buffer_size=1
+            )
+
+            async def token_stream():
+                logger.debug(f"STREAM: Starting token_stream for {sanitized_message[:20]}...")
+                async for event in agent.stream(
+                    query=sanitized_message,
+                    user_id=user_id,
+                    user_timezone=user_timezone,
+                    document_ids=validated_doc_ids,
+                    thread_id=message.thread_id,
+                ):
+                    event_type = event.get("type")
+                    if event_type == "token" and event.get("content"):
+                        yield event["content"]
+                    elif event_type == "node_start":
+                        node = event.get("node")
+                        logger.debug(f"STREAM: Node started - {node}")
+                        # We can't yield status events here easily as streaming_manager expects tokens
+                        # But logging confirms progress
+                    elif event_type == "node_end":
+                         logger.debug(f"STREAM: Node ended - {event.get('node')}")
+
+            async for event in streaming_manager.stream_with_timeout(token_stream(), send_heartbeat=True):
+                yield event.to_sse()
+                if event.type == StreamEventType.TOKEN:
+                    full_response += event.data
+                if event.type == StreamEventType.ERROR:
+                    stream_completed = True
+                    break
+
+            if not stream_completed:
+                total_time = time.time() - start_time
+                yield CompleteEvent(data={
+                    "total_time": round(total_time, 3),
+                    "total_tokens": streaming_manager._tokens_sent,
+                    "provider": llm_factory.get_provider_info(),
+                    "status": "success"
+                }).to_sse()
+                stream_completed = True
+
+                save_task = asyncio.create_task(_save_history(
+                    user_id=user_id,
+                    message=sanitized_message,
+                    document_ids=validated_doc_ids,
+                    response=full_response,
+                    response_time=total_time,
+                    thread_id=message.thread_id
+                ))
+                _track_background_task(save_task)
+
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            if not stream_completed:
+                yield ErrorEvent(data={"message": str(e), "code": "STREAMING_ERROR"}).to_sse()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+async def _save_history(user_id, message, document_ids, response, response_time, thread_id=None):
+    """Save chat history in background."""
+    try:
+        await chat_history_repository.create({
+            "user_id": user_id,
+            "user_message": message,
+            "bot_response": response,
+            "document_ids": document_ids or [],
+            "response_time": round(response_time, 3),
+            "has_documents": bool(document_ids),
+            "sources_used": len(document_ids) if document_ids else 0,
+            "provider": llm_factory.get_provider_info(),
+            "thread_id": thread_id
+        })
     except Exception as e:
-        logger.error(f"Chat error for user {user_id}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An error occurred processing your request")
+        logger.error(f"Failed to save history: {e}")
 
 
 @router.get("/history", response_model=ChatHistory)
@@ -111,31 +193,10 @@ async def get_chat_history(
     limit: int = 50,
     user_id: str = Depends(get_current_user_id)
 ):
-    """Get user's chat history."""
-    if limit <= 0 or limit > 1000:
-        raise HTTPException(status_code=400, detail="Limit must be between 1 and 1000")
-
+    """Get chat history."""
     try:
-        result = supabase_client.table("chat_history") \
-            .select("*") \
-            .eq("user_id", user_id) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
-
-        messages = [
-            ChatResponse(
-                id=msg["id"],
-                user_message=msg["user_message"],
-                bot_response=msg["bot_response"],
-                document_ids=msg.get("document_ids"),
-                created_at=msg["created_at"]
-            )
-            for msg in result.data
-        ]
-
+        messages = await chat_history_repository.get_by_user(user_id, limit)
         return ChatHistory(messages=messages)
-
     except Exception as e:
-        logger.error(f"Error fetching chat history for user {user_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to fetch chat history")
+        logger.error(f"Error fetching history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch history")

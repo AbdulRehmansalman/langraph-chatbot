@@ -685,6 +685,12 @@ async def intent_aware_retrieval_node(state: dict[str, Any]) -> dict[str, Any]:
         if documents:
             updates.update(add_documents(state, documents))
             logger.info(f"Intent retrieval found {len(documents)} documents")
+            
+            # Log top results with wording for debugging (INFO level for visibility)
+            for i, doc in enumerate(documents[:3]):
+                content_preview = doc.get("content", "")[:250].replace("\n", " ")
+                logger.info(f"🔍 INTENT CHUNK {i+1}: source={doc.get('source', 'unknown')}")
+                logger.info(f"    - Wording: {content_preview}...")
         else:
             logger.warning("Intent retrieval found no documents")
             updates.update(add_error(

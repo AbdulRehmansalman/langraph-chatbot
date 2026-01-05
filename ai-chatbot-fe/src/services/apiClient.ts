@@ -1,8 +1,8 @@
-import axios from 'axios';
 import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { handleApiError, withRetry, isTokenExpired } from '../utils/api';
-import { storage } from '../utils/storage';
+import axios from 'axios';
 import type { ApiRequestConfig } from '../types';
+import { handleApiError, isTokenExpired, withRetry } from '../utils/api';
+import { storage } from '../utils/storage';
 
 // Get API URL from environment variable (Vite)
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -13,7 +13,7 @@ class ApiClient {
   constructor(baseURL: string = API_BASE_URL) {
     this.instance = axios.create({
       baseURL,
-      timeout: 60000, // Increased to 60 seconds
+      timeout: 300000,
       headers: {
         'Content-Type': 'application/json',
       },

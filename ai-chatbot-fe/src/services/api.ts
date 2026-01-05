@@ -84,10 +84,6 @@ export const documentsAPI = {
 
 // Chat API
 export const chatAPI = {
-  async sendMessage(message: ChatMessage): Promise<ChatResponse> {
-    return apiClient.post('/api/chat/message', message);
-  },
-
   async getHistory(limit: number = 50): Promise<ChatHistory> {
     return apiClient.get(`/api/chat/history?limit=${limit}`);
   },

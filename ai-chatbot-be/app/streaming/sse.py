@@ -66,7 +66,7 @@ class StreamEvent(BaseModel):
     type: StreamEventType
     data: Dict[str, Any] | str | None = None
     timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-
+#Frontend can use this for the Orderign events,Metrics and Debugging like 
     def to_sse(self) -> str:
         """
         Convert to Server-Sent Events wire format.
@@ -75,7 +75,7 @@ class StreamEvent(BaseModel):
             SSE-formatted string: "data: {json}\n\n"
         """
         return f"data: {self.model_dump_json()}\n\n"
-
+# /n/n end the sse event
 
 class TokenEvent(StreamEvent):
     """Token streaming event - contains generated text chunk."""
@@ -232,7 +232,7 @@ class StreamingManager:
                     yield TokenEvent(data=buffer)
                     buffer = ""
 
-                # Send heartbeat/progress if needed
+                # Send heartbeat/progress if needed as it checks every time  when new token arrives or tokens the generator yields
                 if send_heartbeat:
                     current_time = time.time()
                     if current_time - self._last_heartbeat >= self.heartbeat_interval:
@@ -292,6 +292,27 @@ class StreamingManager:
         return round(remaining_tokens * avg_time_per_token, 2)
 
 
+
+def create_error_stream(error_message: str, error_code: str = "ERROR") -> str:
+    """
+    Create an SSE error event string.
+
+    Args:
+        error_message: Error message to include
+        error_code: Error code for categorization
+
+    Returns:
+        SSE-formatted error event string
+    """
+    event = ErrorEvent(data={
+        "message": error_message,
+        "code": error_code,
+        "recoverable": False
+    })
+    return event.to_sse()
+
+
+#todo Not being used yet 
 async def create_sse_stream(
     events: AsyncIterator[StreamEvent],
     include_heartbeat: bool = True
@@ -339,20 +360,4 @@ async def create_sse_stream(
         }).to_sse()
 
 
-def create_error_stream(error_message: str, error_code: str = "ERROR") -> str:
-    """
-    Create an SSE error event string.
 
-    Args:
-        error_message: Error message to include
-        error_code: Error code for categorization
-
-    Returns:
-        SSE-formatted error event string
-    """
-    event = ErrorEvent(data={
-        "message": error_message,
-        "code": error_code,
-        "recoverable": False
-    })
-    return event.to_sse()
