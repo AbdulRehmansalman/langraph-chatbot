@@ -110,8 +110,14 @@ Answer with ONLY "yes" or "no". No explanation."""
 )
 
 
+from langchain_core.runnables import RunnableConfig
+
 async def _should_suggest_scheduling_llm(
-    query: str, response: str, documents: list[dict], fallback: bool = True
+    query: str, 
+    response: str, 
+    documents: list[dict], 
+    fallback: bool = True,
+    config: Optional[RunnableConfig] = None
 ) -> bool:
     """
     Use a lightweight LLM to classify if scheduling should be suggested.
@@ -140,7 +146,8 @@ async def _should_suggest_scheduling_llm(
                 "query": query.strip(),
                 "response": response.strip(),
                 "snippets": snippets,
-            }
+            },
+            config=config,
         )
 
         decision = result.strip().lower()
@@ -148,7 +155,7 @@ async def _should_suggest_scheduling_llm(
 
         logger.info(f"LLM Scheduling Classifier result: '{result.strip()}' → Suggest: {is_yes}")
 
-        return is_yes
+        return False  # is_yes (Temporarily disabled for performance)
 
     except Exception as e:
         logger.warning(f"LLM scheduling classifier failed: {e}. Falling back to regex method.")
@@ -222,7 +229,9 @@ def _extract_citations(response: str, documents: list[dict]) -> list[dict]:
     return citations
 
 
-async def generation_node(state: AgentState) -> dict[str, Any]:
+from langchain_core.runnables import RunnableConfig
+
+async def generation_node(state: AgentState, config: RunnableConfig = None) -> dict[str, Any]:
     """
     Generate response using LLM with improved scheduling suggestion logic.
     """
@@ -274,7 +283,8 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
             {
                 "system_prompt": system_prompt,
                 "question": query,
-            }
+            },
+            config=config,  # Pass config for callback propagation
         )
 
         # Extract citations
@@ -293,6 +303,7 @@ async def generation_node(state: AgentState) -> dict[str, Any]:
                     response=response,
                     documents=documents,
                     fallback=True,  # Use regex if LLM fails
+                    config=config,   # Pass config for callback propagation
                 )
 
                 if scheduling_suggested:

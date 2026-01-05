@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 RETRIEVAL_TIMEOUT = 10.0  # seconds
-VECTOR_FETCH_COUNT = 15   # Candidates from vector search
-KEYWORD_FETCH_COUNT = 15  # Candidates from keyword search
+VECTOR_FETCH_COUNT = 5   # Candidates from vector search
+KEYWORD_FETCH_COUNT = 5  # Candidates from keyword search
 FINAL_RETURN_COUNT = 5    # Results after reranking
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.1"))
 RERANKER_ENABLED = os.getenv("RERANKER_ENABLED", "true").lower() == "true"

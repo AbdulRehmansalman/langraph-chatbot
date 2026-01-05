@@ -1,32 +1,26 @@
 """
 Chat API Routes
 ===============
-Production-ready chat endpoints with enterprise validation and guardrails.
-
-Enterprise Features:
-- Strong Pydantic validation at API boundary
-- Prompt injection detection
-- Input sanitization before RAG
-- Request size limits
-- Clear error messages
+Production-ready chat endpoints with real-time streaming.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+import asyncio
 import time
 import logging
-
-import asyncio
-from typing import Set, Optional
+from typing import Set
 
 from app.models.schemas import ChatHistory, StreamingChatRequest
 from app.api.dependencies.auth import get_current_user_id
 from app.core.exceptions import ValidationException
 from app.validation.input import validate_and_sanitize
 from app.repositories import chat_history_repository
-from app.rag.chain import create_rag_chain, get_llm_provider
+from app.rag.langgraph import create_agent
+from app.services.llm_factory import llm_factory
 from app.streaming.sse import (
     StreamingManager,
+    StreamEventType,
     StatusEvent,
     StreamStatus,
     CompleteEvent,
@@ -37,28 +31,41 @@ from app.streaming.sse import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Shared agent singleton
+_agent = None
 
-# Background task tracking to prevent garbage collection of pending saves
+
+def _get_agent():
+    """Get or create shared agent."""
+    global _agent
+    if _agent is None:
+        _agent = create_agent()
+        logger.info("Created shared agent")
+    return _agent
+
+
+def _get_user_timezone(user_id: str) -> str:
+    """Fetch user timezone from database."""
+    try:
+        from app.services.supabase_client import supabase_client
+        result = supabase_client.table("users").select("timezone").eq("id", user_id).execute()
+        if result.data and result.data[0].get("timezone"):
+            return result.data[0]["timezone"]
+    except Exception as e:
+        logger.warning(f"Failed to fetch timezone: {e}")
+    return "UTC"
+
+
+# Background task tracking
 _background_tasks: Set[asyncio.Task] = set()
 _MAX_BACKGROUND_TASKS = 1000
-
 
 def _track_background_task(task: asyncio.Task) -> None:
     """Track background task and clean up when done."""
     if len(_background_tasks) > _MAX_BACKGROUND_TASKS:
-        completed = {t for t in _background_tasks if t.done()}
-        _background_tasks.difference_update(completed)
-
+        _background_tasks.difference_update({t for t in _background_tasks if t.done()})
     _background_tasks.add(task)
-# Runs when tASK fINISHES
-    def _on_done(t: asyncio.Task) -> None:
-        _background_tasks.discard(t)
-        if not t.cancelled():
-            exc = t.exception()
-            if exc:
-                logger.error(f"Background task failed: {exc}", exc_info=exc)
-# Registers _on_done to automatically run when the task completes.
-    task.add_done_callback(_on_done)
+    task.add_done_callback(lambda t: _background_tasks.discard(t))
 
 
 @router.post("/stream")
@@ -66,21 +73,19 @@ async def stream_chat_response(
     message: StreamingChatRequest,
     user_id: str = Depends(get_current_user_id)
 ):
-    """Stream chat response using SSE."""
+    """Stream chat response using SSE with real-time LLM streaming."""
     try:
         sanitized_message, validated_doc_ids = validate_and_sanitize(
             message.message,
             message.document_ids
         )
-        # as when user sen dtoo ong message so it gives streaming eror not crahs
     except ValidationException as e:
         return StreamingResponse(
             iter([create_error_stream(e.message, "VALIDATION_ERROR")]),
             media_type="text/event-stream"
         )
 
-    logger.info(f"Streaming request - User: {user_id}, Message: {sanitized_message[:50]}...")
-    llm_provider = get_llm_provider()
+    logger.info(f"Stream request - User: {user_id}, Message: {sanitized_message[:50]}...")
 
     async def event_generator():
         start_time = time.time()
@@ -88,31 +93,48 @@ async def stream_chat_response(
         stream_completed = False
 
         try:
+            logger.info("STREAM: Starting event generator")
             yield StatusEvent(data={"status": StreamStatus.STARTING, "message": "Initializing..."}).to_sse()
-            await asyncio.sleep(0.05)
-            yield StatusEvent(data={"status": StreamStatus.RETRIEVING, "message": "Searching..."}).to_sse()
+            await asyncio.sleep(0)  # Force flush
 
-            rag_chain = create_rag_chain(
-                user_id=user_id,
-                document_ids=validated_doc_ids,
-                thread_id=message.thread_id,
-            )
+            agent = _get_agent()
+            user_timezone = _get_user_timezone(user_id)
 
+            logger.info("STREAM: Agent retrieved")
+            yield StatusEvent(data={"status": StreamStatus.GENERATING, "message": "Generating..."}).to_sse()
+            await asyncio.sleep(0)  # Force flush
+# manages how tokens are streamed
             streaming_manager = StreamingManager(
                 timeout=float(message.stream_timeout),
                 heartbeat_interval=2.0,
-                buffer_size=1   
+                buffer_size=1
             )
 
-            yield StatusEvent(data={"status": StreamStatus.GENERATING, "message": "Generating..."}).to_sse()
+            async def token_stream():
+                logger.debug(f"STREAM: Starting token_stream for {sanitized_message[:20]}...")
+                async for event in agent.stream(
+                    query=sanitized_message,
+                    user_id=user_id,
+                    user_timezone=user_timezone,
+                    document_ids=validated_doc_ids,
+                    thread_id=message.thread_id,
+                ):
+                    event_type = event.get("type")
+                    if event_type == "token" and event.get("content"):
+                        yield event["content"]
+                    elif event_type == "node_start":
+                        node = event.get("node")
+                        logger.debug(f"STREAM: Node started - {node}")
+                        # We can't yield status events here easily as streaming_manager expects tokens
+                        # But logging confirms progress
+                    elif event_type == "node_end":
+                         logger.debug(f"STREAM: Node ended - {event.get('node')}")
 
-            async_stream = rag_chain.stream(sanitized_message)
-
-            async for event in streaming_manager.stream_with_timeout(async_stream, send_heartbeat=True):
+            async for event in streaming_manager.stream_with_timeout(token_stream(), send_heartbeat=True):
                 yield event.to_sse()
-                if event.type == "token":
+                if event.type == StreamEventType.TOKEN:
                     full_response += event.data
-                if event.type == "error":
+                if event.type == StreamEventType.ERROR:
                     stream_completed = True
                     break
 
@@ -121,18 +143,17 @@ async def stream_chat_response(
                 yield CompleteEvent(data={
                     "total_time": round(total_time, 3),
                     "total_tokens": streaming_manager._tokens_sent,
-                    "provider": llm_provider,
+                    "provider": llm_factory.get_provider_info(),
                     "status": "success"
                 }).to_sse()
                 stream_completed = True
 
-                save_task = asyncio.create_task(_save_streaming_history(
+                save_task = asyncio.create_task(_save_history(
                     user_id=user_id,
                     message=sanitized_message,
                     document_ids=validated_doc_ids,
                     response=full_response,
                     response_time=total_time,
-                    provider=llm_provider,
                     thread_id=message.thread_id
                 ))
                 _track_background_task(save_task)
@@ -149,10 +170,10 @@ async def stream_chat_response(
     )
 
 
-async def _save_streaming_history(user_id, message, document_ids, response, response_time, provider, thread_id=None):
-    """Save history in background."""
+async def _save_history(user_id, message, document_ids, response, response_time, thread_id=None):
+    """Save chat history in background."""
     try:
-        chat_data = {
+        await chat_history_repository.create({
             "user_id": user_id,
             "user_message": message,
             "bot_response": response,
@@ -160,10 +181,9 @@ async def _save_streaming_history(user_id, message, document_ids, response, resp
             "response_time": round(response_time, 3),
             "has_documents": bool(document_ids),
             "sources_used": len(document_ids) if document_ids else 0,
-            "provider": provider,
+            "provider": llm_factory.get_provider_info(),
             "thread_id": thread_id
-        }
-        await chat_history_repository.create(chat_data)
+        })
     except Exception as e:
         logger.error(f"Failed to save history: {e}")
 

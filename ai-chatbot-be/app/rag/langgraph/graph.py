@@ -1481,10 +1481,11 @@ class Agent:
         query: str,
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        user_timezone: Optional[str] = None,
         document_ids: Optional[list[str]] = None,
         thread_id: Optional[str] = None,
     ) -> AsyncIterator[dict]:
-        """Stream agent execution."""
+        """Stream agent execution with real-time LLM token streaming."""
         initial_state = create_initial_state(
             query=query,
             user_id=user_id,
@@ -1492,6 +1493,7 @@ class Agent:
             document_ids=document_ids,
             thread_id=thread_id,
         )
+        initial_state["user_timezone"] = user_timezone or "UTC"
 
         config = {"configurable": {"thread_id": initial_state["thread_id"]}}
 
@@ -1504,10 +1506,13 @@ class Agent:
             elif event_type == "on_chain_end":
                 yield {"type": "node_end", "node": event.get("name", "")}
 
-            elif event_type == "on_llm_stream":
+            elif event_type == "on_llm_stream" or event_type == "on_chat_model_stream":
                 chunk = event.get("data", {}).get("chunk", "")
                 if hasattr(chunk, "content") and chunk.content:
                     yield {"type": "token", "content": chunk.content}
+            
+            # Log for debugging
+            # logger.debug(f"GRAPH STREAM: {event_type} - {event.get('name')}")
 
     def get_graph(self) -> StateGraph:
         """Get underlying graph."""
