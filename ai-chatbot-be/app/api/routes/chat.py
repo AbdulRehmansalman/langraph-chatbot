@@ -36,11 +36,15 @@ _agent = None
 
 
 def _get_agent():
-    """Get or create shared agent."""
+    """Get or create shared agent with Human-in-the-Loop enabled."""
     global _agent
     if _agent is None:
-        _agent = create_agent()
-        logger.info("Created shared agent")
+        # Enable human review gate and postgres persistence
+        _agent = create_agent(
+            enable_human_review=True,
+            use_postgres_checkpointer=True
+        )
+        logger.info("Created shared agent with HITL and Postgres Checkpointer")
     return _agent
 
 

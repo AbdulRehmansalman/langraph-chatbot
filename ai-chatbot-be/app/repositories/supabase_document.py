@@ -18,11 +18,8 @@ Enterprise Rationale:
 """
 
 from typing import List, Optional, Dict, Any, BinaryIO
-from uuid import UUID
 import logging
-from pathlib import Path
 from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
 
 from app.core.config import settings
 from app.core.storage_exceptions import (

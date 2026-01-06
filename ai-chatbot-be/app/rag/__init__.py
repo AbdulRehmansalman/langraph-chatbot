@@ -21,7 +21,6 @@ Usage:
 # Document processing
 from app.rag.documents.loader import DocumentLoaderService
 from app.rag.documents.splitter import TextSplitterService
-from app.rag.documents.validator import DocumentValidator
 
 # Embeddings
 from app.rag.embeddings.service import EmbeddingsService
@@ -41,7 +40,6 @@ __all__ = [
     # Documents
     "DocumentLoaderService",
     "TextSplitterService",
-    "DocumentValidator",
     # Embeddings
     "EmbeddingsService",
     # Models
