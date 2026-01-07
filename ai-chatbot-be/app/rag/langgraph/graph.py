@@ -12,9 +12,10 @@ Production-ready agent graph with:
 
 Graph Structure:
     entry → router → [document | calendar | direct] → response → END
-                   ↘ greeting → END
+                   ↘ greeting → END remove it 
                    ↘ execute_scheduling → END (user confirmed with "yes")
                    ↘ human_review → response → END
+                   calendar node is not being present for controlligits behaviour state like . 
 
 Scheduling Flow:
     1. User: "Schedule CBC test tomorrow at 3pm"
@@ -22,6 +23,7 @@ Scheduling Flow:
     3. User: "yes"
     4. router: Detects confirmation, routes to execute_scheduling
     5. execute_scheduling: Calls schedule_meeting tool, confirms booking
+
 """
 
 import logging
@@ -47,16 +49,7 @@ from app.rag.langgraph.state import (
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# ROUTING CONFIGURATION
-# =============================================================================
-
 ROUTING_USE_LLM = os.getenv("ROUTING_USE_LLM", "true").lower() == "true"  # Default to LLM routing
-
-
-# =============================================================================
-# ROUTING PATTERNS (Rule-Based - Simplified for fast path only)
-# =============================================================================
 
 # Greeting patterns - short greetings that don't need retrieval
 GREETING_PATTERNS = [
@@ -158,7 +151,7 @@ async def classify_query_rules(query: str, has_documents: bool = False) -> tuple
     # Default to LLM for everything else
     return "llm_needed", "Fallback to LLM classification"
 
-
+# 2 llm calls not being used . in file 
 async def _classify_with_llm(query: str) -> str:
     """
     Use LLM for query classification.
@@ -193,9 +186,7 @@ Category:"""
         return "document"
 
 
-# =============================================================================
 # SERVICE RETRIEVAL VIA RAG
-# =============================================================================
 
 async def retrieve_service_from_documents(
     query: str,
@@ -285,7 +276,7 @@ async def retrieve_service_from_documents(
             "similar_services": [],
         }
 
-
+# titlle name will be dynamiclaly be extracted not by simple extraction as it left so it is like so 
 def _extract_title_from_query(query: str) -> str:
     """
     Extract appointment title from query.
@@ -298,7 +289,7 @@ def _extract_title_from_query(query: str) -> str:
     # Remove common scheduling phrases (simplified)
     scheduling_phrases = [
         r'\b(schedule|book|set up|create|make|reserve)\s+(a|an|my|the)?\s*',
-        r'\b(appointment|meeting|session)\s+(for|at|on)?\s*',
+        r'\b(appointment|session)\s+(for|at|on)?\s*',
         r'\b(at|around|by)\s+\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b',
     ]
 
@@ -317,9 +308,7 @@ def _extract_title_from_query(query: str) -> str:
     return "Appointment"
 
 
-# =============================================================================
 # ROUTING FUNCTIONS
-# =============================================================================
 
 def route_after_router(state: AgentState) -> Literal["document", "calendar", "greeting", "direct", "human_review", "error"]:
     """
@@ -362,7 +351,7 @@ def route_after_approval(state: AgentState) -> Literal["response", "end"]:
 
     return "end"
 
-
+# as it shold ask in the creating, 
 def should_require_approval(state: AgentState) -> bool:
     """Check if action requires human approval."""
     action = state.get("calendar_action")
@@ -371,9 +360,7 @@ def should_require_approval(state: AgentState) -> bool:
     return state.get("requires_approval", False)
 
 
-# =============================================================================
 # NODE FUNCTIONS
-# =============================================================================
 
 async def entry_node(state: AgentState) -> dict:
     """Entry point - initialize and validate."""
@@ -579,6 +566,7 @@ async def calendar_node(state: AgentState) -> dict:
         if state_messages:
             recent = state_messages[-5:]
             for msg in recent:
+                # as it also checke repsosnses as it will remmeber that it will say that the appointment is confirm or not so it has previous memory also of both 
                 role = "User" if isinstance(msg, HumanMessage) else "Assistant"
                 chat_history += f"{role}: {msg.content[:200]}\n"
 
@@ -620,6 +608,7 @@ Use the appropriate calendar tools to handle this request.""")
     return updates
 
 
+# not being specially USEED I THINK SO MAKE IT USED
 async def human_review_node(state: AgentState) -> dict:
     """Human-in-the-loop review gate."""
     from app.rag.langgraph.nodes.human_review import human_review_node as review
@@ -863,7 +852,7 @@ class Agent:
             )
 
         return response_data
-
+# as it is using the chat sse events for streaming 
     async def stream(
         self,
         query: str,

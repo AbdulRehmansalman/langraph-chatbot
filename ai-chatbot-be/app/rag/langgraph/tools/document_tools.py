@@ -1,14 +1,4 @@
-"""
-Document Analysis Tools
-=======================
-
-Production tools for document analysis including:
-- Document search
-- Section extraction
-- Summarization
-- Metadata retrieval
-"""
-
+# this fielnot being used elsewherere
 import logging
 from typing import Any, Optional
 from datetime import datetime

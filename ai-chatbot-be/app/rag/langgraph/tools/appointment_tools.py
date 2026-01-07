@@ -312,7 +312,7 @@ def extract_attendees(text: str) -> list[str]:
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
     return re.findall(email_pattern, text)
 
-
+# SAME WORK IS DONE BY THE GRAPH.PY FILE
 def extract_meeting_title(text: str) -> str:
     """
     Extract appointment title from query.

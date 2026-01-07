@@ -67,13 +67,10 @@ class CalendarEvent(BaseModel):
     """Calendar event data."""
     id: Optional[str] = None
     title: str = ""
-    description: Optional[str] = None
     start_time: Optional[str] = None
-    end_time: Optional[str] = None
     duration_minutes: int = 60
     location: Optional[str] = None
     attendees: list[str] = Field(default_factory=list)
-    google_meet_link: Optional[str] = None
     calendar_link: Optional[str] = None
     status: str = "pending"
 
@@ -274,7 +271,7 @@ def create_initial_state(
         # Calendar
         calendar_action=None,
         calendar_events=[],
-        scheduled_meeting=None,
+        scheduled_appointments=None,
 
         # Scheduling Flow
         scheduling_suggested=False,
@@ -408,7 +405,7 @@ def update_metrics(
 
     return {"metrics": metrics}
 
-
+# build final prompt context
 def get_response_context(state: AgentState) -> str:
     """Get formatted context for response generation."""
     context = state.get("context", "")
@@ -425,8 +422,7 @@ def get_response_context(state: AgentState) -> str:
     meeting = state.get("scheduled_meeting")
     if meeting:
         context += f"\n\nScheduled Meeting:\n- Title: {meeting.get('title')}\n- Time: {meeting.get('start_time')}\n"
-        if meeting.get("google_meet_link"):
-            context += f"- Meet Link: {meeting.get('google_meet_link')}\n"
+        
 
     return context
 
