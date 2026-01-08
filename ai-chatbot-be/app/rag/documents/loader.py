@@ -20,7 +20,6 @@ from langchain_community.document_loaders import (
     UnstructuredHTMLLoader,
     UnstructuredMarkdownLoader,
 )
-from langchain_community.document_loaders.base import BaseLoader
 
 # For in-memory loading
 import PyPDF2

@@ -205,7 +205,7 @@ class DocumentProcessor:
             supabase_client.table("document_chunks").insert(records).execute()
 
         return len(records)
-
+        # Not being used
     async def reprocess_document(
         self,
         document_id: str,
@@ -236,7 +236,7 @@ class DocumentProcessor:
             content_type=content_type,
             filename=filename,
         )
-
+# not beig used
     def delete_document_chunks(self, document_id: str) -> int:
         """
         Delete all chunks for a document.
@@ -253,6 +253,7 @@ class DocumentProcessor:
 
         return len(result.data) if result.data else 0
 
+# NOT BEING USED
     def search_documents(
         self,
         query: str,
